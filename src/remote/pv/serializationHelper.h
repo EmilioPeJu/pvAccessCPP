@@ -20,7 +20,8 @@
 namespace epics {
 namespace pvAccess {
 
-class epicsShareClass SerializationHelper : public epics::pvData::NoDefaultMethods {
+class epicsShareClass SerializationHelper {
+    EPICS_NOT_COPYABLE(SerializationHelper)
 public:
 
     static epics::pvData::PVDataCreatePtr _pvDataCreate;
@@ -33,14 +34,6 @@ public:
     static epics::pvData::PVStructure::shared_pointer deserializePVRequest(epics::pvData::ByteBuffer* payloadBuffer, epics::pvData::DeserializableControl* control);
 
     /**
-     * Deserialize Structure and create PVStructure instance.
-     * @param payloadBuffer data buffer.
-     * @param control deserialization control.
-     * @return PVStructure instance, can be <code>null</code>.
-     */
-    static epics::pvData::PVStructure::shared_pointer deserializeStructureAndCreatePVStructure(epics::pvData::ByteBuffer* payloadBuffer, epics::pvData::DeserializableControl* control);
-
-    /**
      * Deserialize Structure and create PVStructure instance, if necessary.
      * @param payloadBuffer data buffer.
      * @param control deserialization control.
@@ -48,7 +41,9 @@ public:
      * 			<code>existingStructure</code> instance is returned. <code>null</code> value is allowed.
      * @return PVStructure instance, can be <code>null</code>.
      */
-    static epics::pvData::PVStructure::shared_pointer deserializeStructureAndCreatePVStructure(epics::pvData::ByteBuffer* payloadBuffer, epics::pvData::DeserializableControl* control, epics::pvData::PVStructure::shared_pointer const & existingStructure);
+    static epics::pvData::PVStructure::shared_pointer deserializeStructureAndCreatePVStructure(epics::pvData::ByteBuffer* payloadBuffer,
+                                                                                               epics::pvData::DeserializableControl* control,
+                                                                                               epics::pvData::PVStructure::shared_pointer const & existingStructure = epics::pvData::PVStructure::shared_pointer());
 
     /**
      * Deserialize optional PVStructrue.

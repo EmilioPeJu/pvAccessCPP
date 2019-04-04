@@ -5,6 +5,8 @@
 
 #include <epicsMutex.h>
 #include <epicsGuard.h>
+#include <epicsEvent.h>
+#include <epicsThread.h>
 
 #include <pv/current_function.h>
 #include <pv/pvData.h>
@@ -16,17 +18,14 @@
 #include "clientpvt.h"
 #include "pv/pvAccess.h"
 
-namespace pvd = epics::pvData;
-namespace pva = epics::pvAccess;
-typedef epicsGuard<epicsMutex> Guard;
-typedef epicsGuardRelease<epicsMutex> UnGuard;
-
 namespace pvac {
+using pvac::detail::CallbackGuard;
+using pvac::detail::CallbackUse;
 
-struct Monitor::Impl : public pva::MonitorRequester,
+struct Monitor::Impl : public pvac::detail::CallbackStorage,
+                       public pva::MonitorRequester,
                        public pvac::detail::wrapped_shared_from_this<Monitor::Impl>
 {
-    mutable epicsMutex mutex;
     pva::Channel::shared_pointer chan;
     operation_type::shared_pointer op;
     bool started, done, seenEmpty;
@@ -44,9 +43,14 @@ struct Monitor::Impl : public pva::MonitorRequester,
         ,seenEmpty(false)
         ,cb(cb)
     {REFTRACE_INCREMENT(num_instances);}
-    virtual ~Impl() {REFTRACE_DECREMENT(num_instances);}
+    virtual ~Impl() {
+        CallbackGuard G(*this);
+        cb = 0;
+        G.wait(); // paranoia
+        REFTRACE_DECREMENT(num_instances);
+    }
 
-    void callEvent(Guard& G, MonitorEvent::event_t evt = MonitorEvent::Fail)
+    void callEvent(CallbackGuard& G, MonitorEvent::event_t evt = MonitorEvent::Fail)
     {
         ClientChannel::MonitorCallback *cb=this->cb;
         if(!cb) return;
@@ -57,7 +61,7 @@ struct Monitor::Impl : public pva::MonitorRequester,
             this->cb = 0; // last event
 
         try {
-            UnGuard U(G);
+            CallbackUse U(G);
             cb->monitorEvent(event);
             return;
         }catch(std::exception& e){
@@ -71,7 +75,7 @@ struct Monitor::Impl : public pva::MonitorRequester,
         }
         // continues error handling
         try {
-            UnGuard U(G);
+            CallbackUse U(G);
             cb->monitorEvent(event);
             return;
         }catch(std::exception& e){
@@ -84,7 +88,10 @@ struct Monitor::Impl : public pva::MonitorRequester,
     {
         operation_type::shared_pointer temp;
         {
-            Guard G(mutex);
+            // keepalive for safety in case callback wants to destroy us
+            std::tr1::shared_ptr<Monitor::Impl> keepalive(internal_shared_from_this());
+
+            CallbackGuard G(*this);
 
             last.reset();
 
@@ -95,6 +102,7 @@ struct Monitor::Impl : public pva::MonitorRequester,
             temp.swap(op);
 
             callEvent(G, MonitorEvent::Cancel);
+            G.wait();
         }
         if(temp)
             temp->destroy();
@@ -111,7 +119,8 @@ struct Monitor::Impl : public pva::MonitorRequester,
                                 pva::MonitorPtr const & operation,
                                 pvd::StructureConstPtr const & structure) OVERRIDE FINAL
     {
-        Guard G(mutex);
+        std::tr1::shared_ptr<Monitor::Impl> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
         if(!cb || started || done) return;
 
         if(!status.isOK()) {
@@ -140,7 +149,8 @@ struct Monitor::Impl : public pva::MonitorRequester,
 
     virtual void channelDisconnect(bool destroy) OVERRIDE FINAL
     {
-        Guard G(mutex);
+        std::tr1::shared_ptr<Monitor::Impl> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
         if(!cb || done) return;
         event.message = "Disconnect";
         started = false;
@@ -149,7 +159,8 @@ struct Monitor::Impl : public pva::MonitorRequester,
 
     virtual void monitorEvent(pva::MonitorPtr const & monitor) OVERRIDE FINAL
     {
-        Guard G(mutex);
+        std::tr1::shared_ptr<Monitor::Impl> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
         if(!cb || done) return;
         event.message.clear();
 
@@ -158,7 +169,8 @@ struct Monitor::Impl : public pva::MonitorRequester,
 
     virtual void unlisten(pva::MonitorPtr const & monitor) OVERRIDE FINAL
     {
-        Guard G(mutex);
+        std::tr1::shared_ptr<Monitor::Impl> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
         if(!cb || done) return;
         done = true;
 
@@ -195,17 +207,30 @@ bool Monitor::poll()
     if(!impl) return false;
     Guard G(impl->mutex);
 
-    if(!impl->done && impl->last.next()) {
-        root = impl->last->pvStructurePtr;
+    if(!impl->done && impl->op && impl->started && impl->last.next()) {
+        const epics::pvData::PVStructurePtr& ptr = impl->last->pvStructurePtr;
         changed = *impl->last->changedBitSet;
         overrun = *impl->last->overrunBitSet;
 
+        /* copy the exposed PVStructure for two reasons.
+         * 1. Prevent accidental use of shared container after release()
+         * 2. Allows caller to cache results of getSubField() until root.get() changes.
+         */
+        if(!root || (void*)root->getField().get()!=(void*)ptr->getField().get()) {
+            // initial connection, or new type
+            root = pvd::getPVDataCreate()->createPVStructure(ptr); // also calls copyUnchecked()
+        } else {
+            // same type
+            const_cast<pvd::PVStructure&>(*root).copyUnchecked(*ptr, changed);
+        }
+
+        impl->seenEmpty = false;
     } else {
-        root.reset();
         changed.clear();
         overrun.clear();
+        impl->seenEmpty = true;
     }
-    return impl->seenEmpty = !!root;
+    return !impl->seenEmpty;
 }
 
 bool Monitor::complete() const
@@ -233,6 +258,20 @@ ClientChannel::monitor(MonitorCallback *cb,
     }
 
     return Monitor(ret);
+}
+
+::std::ostream& operator<<(::std::ostream& strm, const Monitor& op)
+{
+    if(op.impl) {
+        strm << "Monitor("
+                "\"" << op.impl->chan->getChannelName() <<"\", "
+                "\"" << op.impl->chan->getProvider()->getProviderName() <<"\", "
+                "connected="<<(op.impl->chan->isConnected()?"true":"false")
+             <<"\")";
+    } else {
+        strm << "Monitor()";
+    }
+    return strm;
 }
 
 namespace detail {

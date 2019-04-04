@@ -39,7 +39,7 @@ ServerContextImpl::ServerContextImpl():
     _broadcastPort(PVA_BROADCAST_PORT),
     _serverPort(PVA_SERVER_PORT),
     _receiveBufferSize(MAX_TCP_RECV),
-    _timer(new Timer("pvAccess-server timer", lowerPriority)),
+    _timer(new Timer("PVAS timers", lowerPriority)),
     _beaconEmitter(),
     _acceptor(),
     _transportRegistry(),
@@ -56,7 +56,6 @@ ServerContextImpl::ServerContextImpl():
     epicsSignalInstallSigPipeIgnore ();
 
     generateGUID();
-    initializeLogger();
 }
 
 ServerContextImpl::~ServerContextImpl()
@@ -67,7 +66,7 @@ ServerContextImpl::~ServerContextImpl()
     }
     catch(std::exception& e)
     {
-        std::cerr<<"Error in: ServerContextImpl::dispose: "<<e.what()<<"\n";
+        std::cerr<<"Error in: ServerContextImpl::~ServerContextImpl: "<<e.what()<<"\n";
     }
     REFTRACE_DECREMENT(num_instances);
 }
@@ -91,11 +90,6 @@ void ServerContextImpl::generateGUID()
     ByteBuffer buffer(_guid.value, sizeof(_guid.value));
     buffer.putLong(startupTime.getSecondsPastEpoch());
     buffer.putInt(startupTime.getNanoseconds());
-}
-
-void ServerContextImpl::initializeLogger()
-{
-    //createFileLogger("serverContextImpl.log");
 }
 
 Configuration::const_shared_pointer ServerContextImpl::getConfiguration()
@@ -189,7 +183,7 @@ void ServerContextImpl::loadConfiguration()
     }
 
     if(_channelProviders.empty())
-        LOG(logLevelError, "ServerContext configured with not Providers will do nothing!\n");
+        LOG(logLevelError, "ServerContext configured with no Providers will do nothing!\n");
 
     //
     // introspect network interfaces
@@ -307,6 +301,12 @@ void ServerContextImpl::run(uint32 seconds)
 
 void ServerContextImpl::shutdown()
 {
+    if(!_timer)
+        return; // already shutdown
+
+    // abort pending timers and prevent new timers from starting
+    _timer->close();
+
     // stop responding to search requests
     for (BlockingUDPTransportVector::const_iterator iter = _udpTransports.begin();
             iter != _udpTransports.end(); iter++)
@@ -346,7 +346,7 @@ void ServerContextImpl::shutdown()
     }
 
     // this will also destroy all channels
-    destroyAllTransports();
+    _transportRegistry.clear();
 
     // drop timer queue
     LEAK_CHECK(_timer, "_timer")
@@ -358,52 +358,6 @@ void ServerContextImpl::shutdown()
     _responseHandler.reset();
 
     _runEvent.signal();
-}
-
-void ServerContextImpl::destroyAllTransports()
-{
-    TransportRegistry::transportVector_t transports;
-    _transportRegistry.toArray(transports);
-
-    size_t size = transports.size();
-    if (size == 0)
-        return;
-
-    LOG(logLevelDebug, "Server context still has %d transport(s) active and closing...", size);
-
-    for (size_t i = 0; i < size; i++)
-    {
-        const Transport::shared_pointer& transport = transports[i];
-        try
-        {
-            transport->close();
-        }
-        catch (std::exception &e)
-        {
-            // do all exception safe, log in case of an error
-            LOG(logLevelError, "Unhandled exception caught from client code at %s:%d: %s", __FILE__, __LINE__, e.what());
-        }
-        catch (...)
-        {
-            // do all exception safe, log in case of an error
-            LOG(logLevelError, "Unhandled exception caught from client code at %s:%d.", __FILE__, __LINE__);
-        }
-    }
-
-    // now clear all (release)
-    _transportRegistry.clear();
-
-    for (size_t i = 0; i < size; i++)
-    {
-        const Transport::shared_pointer& transport = transports[i];
-        transport->waitJoin();
-        LEAK_CHECK(transport, "tcp transport")
-        if(!transport.unique()) {
-            LOG(logLevelError, "Closed transport %s still has use_count=%u",
-                transport->getRemoteName().c_str(),
-                (unsigned)transport.use_count());
-        }
-    }
 }
 
 void ServerContext::printInfo(int lvl)
@@ -483,22 +437,6 @@ void ServerContextImpl::printInfo(ostream& str, int lvl)
     }
 }
 
-void ServerContext::dispose()
-{
-    try
-    {
-        shutdown();
-    }
-    catch(std::exception& e)
-    {
-        std::cerr<<"Error in: ServerContextImpl::dispose: "<<e.what()<<"\n";
-    }
-    catch(...)
-    {
-        std::cerr<<"Oh no, something when wrong in ServerContextImpl::dispose!\n";
-    }
-}
-
 void ServerContextImpl::setBeaconServerStatusProvider(BeaconServerStatusProvider::shared_pointer const & beaconServerStatusProvider)
 {
     _beaconServerStatusProvider = beaconServerStatusProvider;
@@ -553,12 +491,12 @@ const osiSockAddr* ServerContextImpl::getServerInetAddress()
     return NULL;
 }
 
-BlockingUDPTransport::shared_pointer ServerContextImpl::getBroadcastTransport()
+const BlockingUDPTransport::shared_pointer& ServerContextImpl::getBroadcastTransport()
 {
     return _broadcastTransport;
 }
 
-std::vector<ChannelProvider::shared_pointer>& ServerContextImpl::getChannelProviders()
+const std::vector<ChannelProvider::shared_pointer>& ServerContextImpl::getChannelProviders()
 {
     return _channelProviders;
 }
@@ -596,7 +534,7 @@ epicsTimeStamp& ServerContextImpl::getStartTime()
 }
 
 
-std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> >& ServerContextImpl::getSecurityPlugins()
+const Context::securityPlugins_t& ServerContextImpl::getSecurityPlugins()
 {
     return SecurityPluginRegistry::instance().getServerSecurityPlugins();
 }

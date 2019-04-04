@@ -157,18 +157,20 @@ class SecuritySession;
 /**
  * Interface defining transport (connection).
  */
-class Transport : public epics::pvData::DeserializableControl {
+class epicsShareClass Transport : public epics::pvData::DeserializableControl {
 public:
     POINTER_DEFINITIONS(Transport);
 
-    virtual ~Transport() {}
+    static size_t num_instances;
+
+    Transport();
+    virtual ~Transport();
 
     /**
      * Acquires transport.
      * @param client client (channel) acquiring the transport
      * @return <code>true</code> if transport was granted, <code>false</code> otherwise.
      */
-    //virtual bool acquire(ClientChannelImpl::shared_pointer const & client) = 0;
     virtual bool acquire(std::tr1::shared_ptr<ClientChannelImpl> const & client) = 0;
 
     /**
@@ -176,7 +178,6 @@ public:
      * @param client client (channel) releasing the transport
      */
     virtual void release(pvAccessID clientId) = 0;
-    //virtual void release(ClientChannelImpl::shared_pointer const & client) = 0;
 
     /**
      * Get protocol type (tcp, udp, ssl, etc.).
@@ -184,11 +185,7 @@ public:
      */
     virtual std::string getType() const = 0;
 
-    /**
-     * Get remote address.
-     * @return remote address, can be null.
-     */
-    virtual const osiSockAddr* getRemoteAddress() const = 0;
+    virtual const osiSockAddr& getRemoteAddress() const = 0;
 
     virtual const std::string& getRemoteName() const = 0;
 
@@ -313,7 +310,6 @@ public:
 
     virtual epics::pvData::Timer::shared_pointer getTimer() = 0;
 
-    //virtual TransportRegistry::shared_pointer getTransportRegistry() = 0;
     virtual TransportRegistry* getTransportRegistry() = 0;
 
 
@@ -321,11 +317,12 @@ public:
 
     virtual Configuration::const_shared_pointer getConfiguration() = 0;
 
+    typedef std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> > securityPlugins_t;
     /**
      * Get map of available security plug-ins.
      * @return the map of available security plug-ins
      */
-    virtual std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> >& getSecurityPlugins() = 0;
+    virtual const securityPlugins_t& getSecurityPlugins() = 0;
 
 
     ///
@@ -375,28 +372,6 @@ protected:
      * Debug flag.
      */
     epics::pvData::int32 _debugLevel;
-};
-
-/**
- * Interface defining socket connector (Connector-Transport pattern).
- */
-class Connector {
-public:
-    virtual ~Connector() {}
-
-    /**
-     * Connect.
-     * @param[in] client    client requesting connection (transport).
-     * @param[in] address           address of the server.
-     * @param[in] responseHandler   reponse handler.
-     * @param[in] transportRevision transport revision to be used.
-     * @param[in] priority process priority.
-     * @return transport instance.
-     */
-    virtual Transport::shared_pointer connect(std::tr1::shared_ptr<ClientChannelImpl> const & client,
-            ResponseHandler::shared_pointer const & responseHandler, osiSockAddr& address,
-            epics::pvData::int8 transportRevision, epics::pvData::int16 priority) = 0;
-
 };
 
 /**

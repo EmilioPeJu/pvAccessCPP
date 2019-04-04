@@ -1,3 +1,7 @@
+/*
+ * Copyright information and license terms for this software can be
+ * found in the file LICENSE that is included with the distribution
+ */
 
 #include <stdio.h>
 
@@ -67,8 +71,6 @@ string toHex(int8* ba, size_t len) {
 }
 
 
-static string emptyString;
-
 std::size_t readSize(ByteBuffer* buffer) {
     int8 b = buffer->getByte();
     if(b==-1)
@@ -94,7 +96,7 @@ string deserializeString(ByteBuffer* buffer) {
         return str;
     }
     else
-        return emptyString;
+        return std::string();
 }
 
 struct ServerEntry {
@@ -230,7 +232,22 @@ bool discoverServers(double timeOut)
 
     // quary broadcast addresses of all IFs
     InetAddrVector broadcastAddresses;
-    getBroadcastAddresses(broadcastAddresses, socket, broadcastPort);
+    {
+        IfaceNodeVector ifaces;
+        if(discoverInterfaces(ifaces, socket, 0)) {
+            fprintf(stderr, "Unable to populate interface list\n");
+            return false;
+        }
+
+        for(IfaceNodeVector::const_iterator it(ifaces.begin()), end(ifaces.end()); it!=end; ++it)
+        {
+            if(it->validBcast && it->bcast.sa.sa_family == AF_INET) {
+                osiSockAddr bcast = it->bcast;
+                bcast.ia.sin_port = htons(broadcastPort);
+                broadcastAddresses.push_back(bcast);
+            }
+        }
+    }
 
     // set broadcast address list
     if (!addressList.empty())
@@ -250,7 +267,7 @@ bool discoverServers(double timeOut)
 
     for (size_t i = 0; i < broadcastAddresses.size(); i++)
         LOG(logLevelDebug,
-            "Broadcast address #%d: %s.", i, inetAddressToString(broadcastAddresses[i]).c_str());
+            "Broadcast address #%zu: %s.", i, inetAddressToString(broadcastAddresses[i]).c_str());
 
     // ---
 
@@ -318,7 +335,7 @@ bool discoverServers(double timeOut)
     sendBuffer.putByte(PVA_MAGIC);
     sendBuffer.putByte(PVA_VERSION);
     sendBuffer.putByte((EPICS_BYTE_ORDER == EPICS_ENDIAN_BIG) ? 0x80 : 0x00); // data + 7-bit endianess
-    sendBuffer.putByte((int8_t)3);	// search
+    sendBuffer.putByte((int8_t)CMD_SEARCH);	// search
     sendBuffer.putInt(4+1+3+16+2+1+2);		// "zero" payload
 
     sendBuffer.putInt(0);   // sequenceId
@@ -330,13 +347,18 @@ bool discoverServers(double timeOut)
     encodeAsIPv6Address(&sendBuffer, &responseAddress);
     sendBuffer.putShort((int16_t)ntohs(responseAddress.ia.sin_port));
 
-    sendBuffer.putByte((int8_t)0x00);	// no restriction on protocol
-    sendBuffer.putShort((int16_t)0);	// count
+    sendBuffer.putByte((int8_t)0x00);	// protocol count
+    sendBuffer.putShort((int16_t)0);	// name count
 
     bool oneOK = false;
     for (size_t i = 0; i < broadcastAddresses.size(); i++)
     {
-        // send the packet
+        if(pvAccessIsLoggable(logLevelDebug)) {
+            char strBuffer[64];
+            sockAddrToDottedIP(&broadcastAddresses[i].sa, strBuffer, sizeof(strBuffer));
+            LOG(logLevelDebug, "UDP Tx (%zu) -> %s", sendBuffer.getPosition(), strBuffer);
+        }
+
         status = ::sendto(socket, sendBuffer.getArray(), sendBuffer.getPosition(), 0,
                           &broadcastAddresses[i].sa, sizeof(sockaddr));
         if (status < 0)
@@ -372,6 +394,11 @@ bool discoverServers(double timeOut)
 
         if (bytesRead > 0)
         {
+            if(pvAccessIsLoggable(logLevelDebug)) {
+                char strBuffer[64];
+                sockAddrToDottedIP(&fromAddress.sa, strBuffer, sizeof(strBuffer));
+                LOG(logLevelDebug, "UDP Rx (%d) <- %s", bytesRead, strBuffer);
+            }
             receiveBuffer.setPosition(bytesRead);
             receiveBuffer.flip();
 
@@ -490,7 +517,6 @@ int main (int argc, char *argv[])
     int opt;                    /* getopt() current option */
     bool debug = false;
     double timeOut = DEFAULT_TIMEOUT;
-    // char fieldSeparator = ' ';
     bool printInfo = false;
 
     /*
@@ -531,32 +557,6 @@ int main (int argc, char *argv[])
         case 'i':               /* Print server info */
             printInfo = true;
             break;
-        /*
-        case 'F':               // Store this for output formatting
-        fieldSeparator = (char) *optarg;
-        break;
-        case 'f':               // Use input stream as input
-        {
-        string fileName = optarg;
-        if (fileName == "-")
-            inputStream = &cin;
-        else
-        {
-            ifs.open(fileName.c_str(), ifstream::in);
-            if (!ifs)
-            {
-                fprintf(stderr,
-                        "Failed to open file '%s'.\n",
-                        fileName.c_str());
-                return 1;
-            }
-            else
-                inputStream = &ifs;
-        }
-
-        fromStream = true;
-        break;
-        }*/
         case '?':
             fprintf(stderr,
                     "Unrecognized option: '-%c'. ('pvlist -h' for help.)\n",
@@ -606,7 +606,7 @@ int main (int argc, char *argv[])
         {
             const ServerEntry& entry = iter->second;
 
-            cout << "GUID 0x" << entry.guid << ", version " << (int)entry.version << ": "
+            cout << "GUID 0x" << entry.guid << " version " << (int)entry.version << ": "
                  << entry.protocol << "@[";
 
             size_t count = entry.addresses.size();

@@ -101,7 +101,8 @@ public:
 /**
  * Scope lock.
  */
-class epicsShareClass ScopedLock : private epics::pvData::NoDefaultMethods {
+class epicsShareClass ScopedLock {
+    EPICS_NOT_COPYABLE(ScopedLock)
 public:
 
     explicit ScopedLock(Lockable::shared_pointer const & li)
@@ -179,7 +180,7 @@ private:
 /**
  * Base interface for all channel requests (aka. Operations).
  */
-class epicsShareClass ChannelRequest : public virtual Destroyable, public Lockable, private epics::pvData::NoDefaultMethods {
+class epicsShareClass ChannelRequest : public virtual Destroyable, public Lockable {
 public:
     POINTER_DEFINITIONS(ChannelRequest);
 
@@ -211,8 +212,7 @@ public:
     virtual void lastRequest() = 0;
 
 private:
-    ChannelRequest(const ChannelRequest&);
-    ChannelRequest& operator=(const ChannelRequest&);
+    EPICS_NOT_COPYABLE(ChannelRequest)
 };
 
 /**
@@ -376,15 +376,21 @@ public:
 /**
  *
  */
-class epicsShareClass ChannelFind : public Destroyable, private epics::pvData::NoDefaultMethods {
+class epicsShareClass ChannelFind : public Destroyable {
+    EPICS_NOT_COPYABLE(ChannelFind)
 public:
     POINTER_DEFINITIONS(ChannelFind);
     typedef ChannelFindRequester requester_type;
 
+    ChannelFind() {}
     virtual ~ChannelFind() {}
 
     virtual std::tr1::shared_ptr<ChannelProvider> getChannelProvider() = 0;
     virtual void cancel() = 0;
+
+    //! Allocate a no-op ChannelFind.  This is sufficient for most, if not all, ChannelProvider implementations.
+    //! Holds only a weak_ptr<ChannelProvider>
+    static ChannelFind::shared_pointer buildDummy(const std::tr1::shared_ptr<ChannelProvider>& provider);
 };
 
 /**
@@ -829,8 +835,9 @@ class ChannelRequester;
  */
 class epicsShareClass Channel :
     public Requester,
-    public Destroyable,
-    private epics::pvData::NoDefaultMethods {
+    public Destroyable
+{
+    EPICS_NOT_COPYABLE(Channel)
 public:
     POINTER_DEFINITIONS(Channel);
     typedef ChannelRequester requester_type;
@@ -1150,10 +1157,9 @@ enum FlushStrategy {
  *
  * Uniquely configurable (via ChannelProviderFactory::newInstance(Configuration*)
  */
-class epicsShareClass ChannelProvider : public Destroyable, private epics::pvData::NoDefaultMethods
+class epicsShareClass ChannelProvider : public Destroyable
 {
-    ChannelProvider(const ChannelProvider&);
-    ChannelProvider& operator=(const ChannelProvider&);
+    EPICS_NOT_COPYABLE(ChannelProvider)
 public:
     POINTER_DEFINITIONS(ChannelProvider);
 
@@ -1237,23 +1243,17 @@ public:
      */
     virtual Channel::shared_pointer createChannel(std::string const & name,ChannelRequester::shared_pointer const & requester,
             short priority, std::string const & address) = 0;
-
-    //! @deprecated Changing of Configuration after start is not supported
-    virtual void configure(epics::pvData::PVStructure::shared_pointer /*configuration*/) EPICS_DEPRECATED {};
-    //! @deprecated No function
-    virtual void flush() EPICS_DEPRECATED {};
-    //! @deprecated No function
-    virtual void poll() EPICS_DEPRECATED {};
-
 };
 
 /**
  * <code>ChanneProvider</code> factory interface.
  */
-class epicsShareClass ChannelProviderFactory : private epics::pvData::NoDefaultMethods {
+class epicsShareClass ChannelProviderFactory {
+    EPICS_NOT_COPYABLE(ChannelProviderFactory)
 public:
     POINTER_DEFINITIONS(ChannelProviderFactory);
 
+    ChannelProviderFactory() {}
     virtual ~ChannelProviderFactory() {}
 
     /**
@@ -1437,6 +1437,13 @@ public:
         typename Factory::shared_pointer fact(new Factory(name, conf));
         return add(fact, replace) ? fact : typename Factory::shared_pointer();
     }
+
+    //! Add a pre-created Provider instance.
+    //! Only a weak ref to this instance is kept, so the instance must be kept active
+    //! through some external means
+    //! @since 6.1.0
+    ChannelProviderFactory::shared_pointer addSingleton(const ChannelProvider::shared_pointer& provider,
+                                                        bool replace=true);
 
     //! Attempt to remove a factory with the given name.  Return Factory which was removed, or NULL if not found.
     ChannelProviderFactory::shared_pointer remove(const std::string& name);

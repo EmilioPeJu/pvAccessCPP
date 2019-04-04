@@ -18,9 +18,9 @@ using namespace epics::pvData;
 
 namespace {
 struct closer {
-    epics::pvAccess::Transport::shared_pointer P;
-    closer(const epics::pvAccess::Transport::shared_pointer& P) :P(P) {}
-    void operator()(epics::pvAccess::Transport*) {
+    epics::pvAccess::BlockingUDPTransport::shared_pointer P;
+    closer(const epics::pvAccess::BlockingUDPTransport::shared_pointer& P) :P(P) {}
+    void operator()(epics::pvAccess::BlockingUDPTransport*) {
         try{
             P->close();
         }catch(...){
@@ -35,22 +35,19 @@ struct closer {
 namespace epics {
 namespace pvAccess {
 
-Transport::shared_pointer BlockingUDPConnector::connect(std::tr1::shared_ptr<ClientChannelImpl> const & /*client*/,
-        ResponseHandler::shared_pointer const & responseHandler, osiSockAddr& bindAddress,
-        int8 transportRevision, int16 /*priority*/) {
-
-    LOG(logLevelDebug, "Creating datagram socket to: %s.",
-        inetAddressToString(bindAddress).c_str());
-
+BlockingUDPTransport::shared_pointer BlockingUDPConnector::connect(ResponseHandler::shared_pointer const & responseHandler,
+                                                                   osiSockAddr& bindAddress,
+                                                                   int8 transportRevision)
+{
     SOCKET socket = epicsSocketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if(socket==INVALID_SOCKET) {
         char errStr[64];
         epicsSocketConvertErrnoToString(errStr, sizeof(errStr));
         LOG(logLevelError, "Error creating socket: %s.", errStr);
-        return Transport::shared_pointer();
+        return BlockingUDPTransport::shared_pointer();
     }
 
-    int optval = _broadcast ? 1 : 0;
+    int optval = 1;
     int retval = ::setsockopt(socket, SOL_SOCKET, SO_BROADCAST, (char *)&optval, sizeof(optval));
     if(retval<0)
     {
@@ -58,7 +55,7 @@ Transport::shared_pointer BlockingUDPConnector::connect(std::tr1::shared_ptr<Cli
         epicsSocketConvertErrnoToString(errStr, sizeof(errStr));
         LOG(logLevelError, "Error setting SO_BROADCAST: %s.", errStr);
         epicsSocketDestroy (socket);
-        return Transport::shared_pointer();
+        return BlockingUDPTransport::shared_pointer();
     }
 
     /*
@@ -72,8 +69,7 @@ Transport::shared_pointer BlockingUDPConnector::connect(std::tr1::shared_ptr<Cli
 
 
     // set SO_REUSEADDR or SO_REUSEPORT, OS dependant
-    if (_reuseSocket)
-        epicsSocketEnableAddressUseForDatagramFanout(socket);
+    epicsSocketEnableAddressUseForDatagramFanout(socket);
 
     retval = ::bind(socket, (sockaddr*)&(bindAddress.sa), sizeof(sockaddr));
     if(retval<0) {
@@ -83,17 +79,16 @@ Transport::shared_pointer BlockingUDPConnector::connect(std::tr1::shared_ptr<Cli
         epicsSocketConvertErrnoToString(errStr, sizeof(errStr));
         LOG(logLevelError, "Error binding socket %s: %s.", ip, errStr);
         epicsSocketDestroy (socket);
-        return Transport::shared_pointer();
+        return BlockingUDPTransport::shared_pointer();
     }
 
     // sockets are blocking by default
     BlockingUDPTransport::shared_pointer transport(new BlockingUDPTransport(_serverFlag, responseHandler,
             socket, bindAddress, transportRevision));
+    transport->internal_this = transport;
 
     // the worker thread holds a strong ref, which is released by transport->close()
-    // note: casting to Transport* to prevent iOS version of shared_ptr from trying (and failing)
-    //       to setup shared_from_this() using the wrapped pointer
-    Transport::shared_pointer ret(static_cast<Transport*>(transport.get()), closer(transport));
+    BlockingUDPTransport::shared_pointer ret(transport.get(), closer(transport));
 
     return ret;
 }

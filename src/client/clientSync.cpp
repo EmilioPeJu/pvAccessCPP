@@ -10,6 +10,7 @@
 #include <pv/current_function.h>
 #include <pv/pvData.h>
 #include <pv/bitSet.h>
+#include <pv/epicsException.h>
 
 #define epicsExportSharedSymbols
 #include "pv/logger.h"
@@ -294,6 +295,7 @@ struct MonitorSync::SImpl : public ClientChannel::MonitorCallback
     SImpl(epicsEvent *event)
         :ourevent(!event)
         ,event(ourevent ? new epicsEvent : event)
+        ,hadevent(false)
     {}
     virtual ~SImpl()
     {
@@ -372,6 +374,52 @@ ClientChannel::monitor(const epics::pvData::PVStructure::const_shared_pointer &p
     std::tr1::shared_ptr<MonitorSync::SImpl> simpl(new MonitorSync::SImpl(event));
     Monitor mon(monitor(simpl.get(), pvRequest));
     return MonitorSync(mon, simpl);
+}
+
+namespace {
+
+
+struct InfoWait : public pvac::ClientChannel::InfoCallback,
+                 public WaitCommon
+{
+    pvac::InfoEvent result;
+
+    InfoWait() {}
+    virtual ~InfoWait() {}
+    virtual void infoDone(const pvac::InfoEvent& evt) OVERRIDE FINAL
+    {
+        {
+            Guard G(mutex);
+            if(done) {
+                LOG(pva::logLevelWarn, "oops, double event to InfoCallback");
+            } else {
+                result = evt;
+                done = true;
+            }
+        }
+        event.signal();
+    }
+};
+
+} // namespace
+
+epics::pvData::FieldConstPtr
+ClientChannel::info(double timeout, const std::string& subfld)
+{
+    InfoWait waiter;
+    {
+        Operation op(info(&waiter, subfld));
+        waiter.wait(timeout);
+    }
+    switch(waiter.result.event) {
+    case InfoEvent::Success:
+        return waiter.result.type;
+    case InfoEvent::Fail:
+        throw std::runtime_error(waiter.result.message);
+    default:
+    case InfoEvent::Cancel: // cancel implies timeout, which should already be thrown
+        THROW_EXCEPTION2(std::logic_error, "Cancelled!?!?");
+    }
 }
 
 

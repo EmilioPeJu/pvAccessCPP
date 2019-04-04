@@ -51,7 +51,7 @@ public:
     Transport::shared_pointer getSearchTransport() OVERRIDE FINAL;
     Configuration::const_shared_pointer getConfiguration() OVERRIDE FINAL;
     TransportRegistry* getTransportRegistry() OVERRIDE FINAL;
-    std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> >& getSecurityPlugins() OVERRIDE FINAL;
+    const securityPlugins_t& getSecurityPlugins() OVERRIDE FINAL;
 
     virtual void newServerDetected() OVERRIDE FINAL;
 
@@ -123,13 +123,13 @@ public:
      * Broadcast (UDP send) transport.
      * @return broadcast transport.
      */
-    BlockingUDPTransport::shared_pointer getBroadcastTransport();
+    const BlockingUDPTransport::shared_pointer& getBroadcastTransport();
 
     /**
      * Get channel providers.
      * @return channel providers.
      */
-    virtual std::vector<ChannelProvider::shared_pointer>& getChannelProviders() OVERRIDE FINAL;
+    virtual const std::vector<ChannelProvider::shared_pointer>& getChannelProviders() OVERRIDE FINAL;
 
     /**
      * Return <code>true</code> if channel provider name is provided by configuration (e.g. system env. var.).
@@ -137,6 +137,9 @@ public:
      */
     bool isChannelProviderNamePreconfigured();
 
+    // used by ServerChannelFindRequesterImpl
+    typedef std::map<std::string, std::tr1::weak_ptr<ChannelProvider> > s_channelNameToProvider_t;
+    s_channelNameToProvider_t s_channelNameToProvider;
 private:
 
     /**
@@ -188,9 +191,6 @@ private:
      */
     epics::pvData::int32 _receiveBufferSize;
 
-    /**
-     * Timer.
-     */
     epics::pvData::Timer::shared_pointer _timer;
 
     /**
@@ -198,14 +198,11 @@ private:
      */
     BlockingUDPTransportVector _udpTransports;
 
-    /**
-     * UDP socket used to sending.
+    /** UDP socket used to sending.
+     * constant after ServerContextImpl::initialize()
      */
     BlockingUDPTransport::shared_pointer _broadcastTransport;
 
-    /**
-     * Beacon emitter.
-     */
     BeaconEmitter::shared_pointer _beaconEmitter;
 
     /**
@@ -219,24 +216,15 @@ private:
      */
     TransportRegistry _transportRegistry;
 
-    /**
-     * Response handler.
-     */
     ResponseHandler::shared_pointer _responseHandler;
 
-    /**
-     * Channel provider.
-     */
+    // const after loadConfiguration()
     std::vector<ChannelProvider::shared_pointer> _channelProviders;
 
-    /**
-     * Run mutex.
-     */
+public:
     epics::pvData::Mutex _mutex;
+private:
 
-    /**
-     * Run event.
-     */
     epics::pvData::Event _runEvent;
 
     /**
@@ -244,25 +232,9 @@ private:
      */
     BeaconServerStatusProvider::shared_pointer _beaconServerStatusProvider;
 
-    /**
-     * Generate ServerGUID.
-     */
     void generateGUID();
 
-    /**
-     * Initialize logger.
-     */
-    void initializeLogger();
-
-    /**
-     * Load configuration.
-     */
     void loadConfiguration();
-
-    /**
-     * Destroy all transports.
-     */
-    void destroyAllTransports();
 
     Configuration::const_shared_pointer configuration;
 

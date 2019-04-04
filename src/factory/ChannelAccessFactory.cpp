@@ -9,6 +9,7 @@
 
 #include <osiSock.h>
 #include <epicsThread.h>
+#include <epicsSignal.h>
 
 #include <pv/lock.h>
 #include <pv/noDefaultMethods.h>
@@ -18,13 +19,20 @@
 
 #define epicsExportSharedSymbols
 #include <pv/pvAccess.h>
+#include <pv/clientContextImpl.h>
 #include <pv/factory.h>
 #include "pv/codec.h"
 #include <pv/serverContextImpl.h>
 #include <pv/serverChannelImpl.h>
+#include <pv/blockingUDP.h>
+#include <sharedstateimpl.h>
 
 using namespace epics::pvData;
 using std::string;
+
+namespace pvas {
+void registerRefTrackServer();
+}
 
 namespace epics {
 namespace pvAccess {
@@ -119,6 +127,42 @@ ChannelProviderFactory::shared_pointer ChannelProviderRegistry::add(const std::s
     return add(F, replace) ? F : ChannelProviderFactory::shared_pointer();
 }
 
+namespace {
+//! A ChannelProviderFactory based around a single pre-created ChannelProvider instance.
+//! Only a weak ref to this instance is kept, so the instance must be kept active
+//! through some external means
+struct InstanceChannelProviderFactory : public ChannelProviderFactory
+{
+    InstanceChannelProviderFactory(const std::tr1::shared_ptr<ChannelProvider>& provider)
+        :name(provider->getProviderName())
+        ,provider(provider)
+    {}
+    virtual ~InstanceChannelProviderFactory() {}
+    virtual std::string getFactoryName() OVERRIDE FINAL
+    {
+        return name;
+    }
+    virtual ChannelProvider::shared_pointer sharedInstance() OVERRIDE FINAL
+    {
+        return provider.lock();
+    }
+    virtual ChannelProvider::shared_pointer newInstance(const std::tr1::shared_ptr<Configuration>& conf) OVERRIDE FINAL
+    {
+        return provider.lock();
+    }
+private:
+    const std::string name;
+    const ChannelProvider::weak_pointer provider;
+};
+}//namespace
+
+ChannelProviderFactory::shared_pointer ChannelProviderRegistry::addSingleton(const ChannelProvider::shared_pointer& provider,
+                                                                             bool replace)
+{
+    std::tr1::shared_ptr<InstanceChannelProviderFactory> F(new InstanceChannelProviderFactory(provider));
+    return add(F, replace) ? F : std::tr1::shared_ptr<InstanceChannelProviderFactory>();
+}
+
 ChannelProviderFactory::shared_pointer ChannelProviderRegistry::remove(const std::string& name)
 {
     Lock G(mutex);
@@ -159,21 +203,34 @@ struct providerRegGbl_t {
 
 epicsThreadOnceId providerRegOnce = EPICS_THREAD_ONCE_INIT;
 
+} // namespace
+
 void providerRegInit(void*)
 {
+    epicsSignalInstallSigAlarmIgnore();
+    epicsSignalInstallSigPipeIgnore();
+
     providerRegGbl = new providerRegGbl_t;
+    providerRegGbl->clients->add("pva", createClientProvider);
+
     registerRefCounter("ServerContextImpl", &ServerContextImpl::num_instances);
     registerRefCounter("ServerChannel", &ServerChannel::num_instances);
+    registerRefCounter("Transport (ABC)", &Transport::num_instances);
     registerRefCounter("BlockingTCPTransportCodec", &detail::BlockingTCPTransportCodec::num_instances);
+    registerRefCounter("BlockingUDPTransport", &BlockingUDPTransport::num_instances);
     registerRefCounter("ChannelProvider (ABC)", &ChannelProvider::num_instances);
     registerRefCounter("Channel (ABC)", &Channel::num_instances);
     registerRefCounter("ChannelRequester (ABC)", &ChannelRequester::num_instances);
     registerRefCounter("ChannelBaseRequester (ABC)", &ChannelBaseRequester::num_instances);
     registerRefCounter("ChannelRequest (ABC)", &ChannelRequest::num_instances);
     registerRefCounter("ResponseHandler (ABC)", &ResponseHandler::num_instances);
+    registerRefCounter("MonitorFIFO", &MonitorFIFO::num_instances);
+    pvas::registerRefTrackServer();
+    registerRefCounter("pvas::SharedChannel", &pvas::detail::SharedChannel::num_instances);
+    registerRefCounter("pvas::SharedPut", &pvas::detail::SharedPut::num_instances);
+    registerRefCounter("pvas::SharedRPC", &pvas::detail::SharedRPC::num_instances);
+    registerRefCounter("pvas::SharedPV", &pvas::SharedPV::num_instances);
 }
-
-} // namespace
 
 ChannelProviderRegistry::shared_pointer ChannelProviderRegistry::clients()
 {

@@ -216,6 +216,14 @@ struct Get2PutProxy : public ChannelGet
             return req ? req->getRequesterName() : "";
         }
 
+        virtual void message(const std::string &message, MessageType messageType) OVERRIDE FINAL {
+            ChannelGetRequester::shared_pointer req(requester.lock());
+            if(req)
+                req->message(message, messageType);
+            else
+                ChannelPutRequester::message(message, messageType);
+        }
+
         virtual void channelDisconnect(bool destroy) OVERRIDE FINAL {
             ChannelGetRequester::shared_pointer req(requester.lock());
             if(req)
@@ -259,19 +267,39 @@ struct Get2PutProxy : public ChannelGet
     ChannelPut::shared_pointer op; // the put we wrap
     std::tr1::shared_ptr<Get2PutProxy::Req> op_request; // keep our Req alive
 
+    ChannelPut::shared_pointer OP() {
+        epicsGuard<epicsMutex> G(op_request->mutex);
+        return op;
+    }
+
     Get2PutProxy() {}
     virtual ~Get2PutProxy() {}
 
     virtual void destroy() OVERRIDE FINAL
-    { op->destroy(); }
+    {
+        ChannelPut::shared_pointer O(OP());
+        if(O) O->destroy();
+    }
     virtual std::tr1::shared_ptr<Channel> getChannel() OVERRIDE FINAL
-    { return op->getChannel(); }
+    {
+        ChannelPut::shared_pointer O(OP());
+        return O ? O->getChannel() : std::tr1::shared_ptr<Channel>();
+    }
     virtual void cancel() OVERRIDE FINAL
-    { op->cancel(); }
+    {
+        ChannelPut::shared_pointer O(OP());
+        if(O) O->cancel();
+    }
     virtual void lastRequest() OVERRIDE FINAL
-    { op->lastRequest(); }
+    {
+        ChannelPut::shared_pointer O(OP());
+        if(O) O->lastRequest();
+    }
     virtual void get() OVERRIDE FINAL
-    { op->get(); }
+    {
+        ChannelPut::shared_pointer O(OP());
+        if(O) O->get();
+    }
 };
 }// namespace
 
@@ -410,11 +438,33 @@ ChannelRequester::shared_pointer DefaultChannelRequester::build()
     return ret;
 }
 
-
 MonitorElement::MonitorElement(epics::pvData::PVStructurePtr const & pvStructurePtr)
     : pvStructurePtr(pvStructurePtr)
     ,changedBitSet(epics::pvData::BitSet::create(static_cast<epics::pvData::uint32>(pvStructurePtr->getNumberFields())))
     ,overrunBitSet(epics::pvData::BitSet::create(static_cast<epics::pvData::uint32>(pvStructurePtr->getNumberFields())))
 {}
+
+}} // namespace epics::pvAccess
+
+namespace {
+
+struct DummyChannelFind : public epics::pvAccess::ChannelFind {
+    epics::pvAccess::ChannelProvider::weak_pointer provider;
+    DummyChannelFind(const epics::pvAccess::ChannelProvider::shared_pointer& provider) : provider(provider) {}
+    virtual ~DummyChannelFind() {}
+    virtual void destroy() OVERRIDE FINAL {}
+    virtual epics::pvAccess::ChannelProvider::shared_pointer getChannelProvider() OVERRIDE FINAL { return provider.lock(); }
+    virtual void cancel() OVERRIDE FINAL {}
+};
+
+}
+
+namespace epics {namespace pvAccess {
+
+ChannelFind::shared_pointer ChannelFind::buildDummy(const ChannelProvider::shared_pointer& provider)
+{
+    std::tr1::shared_ptr<DummyChannelFind> ret(new DummyChannelFind(provider));
+    return ret;
+}
 
 }} // namespace epics::pvAccess

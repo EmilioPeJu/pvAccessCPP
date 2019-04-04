@@ -1,7 +1,57 @@
 /** @page pvarelease_notes Release Notes
 
-Release 6.0.0 (UNRELEASED)
-==========================
+Release 6.1.1 (Mar 2019)
+========================
+
+- Fixes
+ - pvcall fix array args
+ - pvinfo show server IP
+
+Release 6.1.0 (Nov 2018)
+========================
+
+- Deprecations
+ - pv/namedLockPattern.h
+ - createFileLogger() from pv/logger.h
+- Removals
+ - No longer install testServer, testGetPerformance, testMonitorPerformance, rpcServiceExample, rpcServiceAsyncExample, rpcWildServiceExample, rpcClientExample, and pipelineServiceExample.
+   These will continue to be built, and may be found under testApp/O.* .
+ - The @b eget CLI utility has moved to https://github.com/epics-base/eget
+   The new @b pvcall and existing pvget replace its role as a low level troubleshooting tool.
+ - Remove deprecated methods configure(), flush(), and poll() from ChannelProvider.
+ - Remove RPCClient::sendRequest()
+ - Remove RPCService::destroy() and dispose()
+ - Typedefs GUID, Service
+- Fixes
+ - epics::pvAccess::pvAccessLog() add EPICS_PRINTF_STYLE()
+ - ioc: shutdown PVA server via epicsAtExit()
+ - fix 'pva' provider registration during static linking
+ - Various fixes related to shared_ptr loop breaking.
+ - Various crashes and deadlocks.
+ - PVA client context: avoid lock order violations
+- Changes
+ - pvac::Monitor - shallow copy into Monitor::root
+ - pvget -m shows time and alarm if available (thanks to Andrew Starritt)
+ - PVA Server now handles pipeline=true automatically for all ChannelProviders.
+   It is only necessary to implement epics::pvAccess::Monitor::reportRemoteQueueStatus()
+   to receive notification of initial window size.
+ - Most locking issues in the 'ca' provider should now be resolved.
+- Additions
+ - Add pvmonitor execuable as an alias for 'pvget -m'.
+ - Add new pvcall executable to make RPC calls with arguments encoded using the NTURI convention.
+ - pvput to NTEnum via. string now supported
+ - pvac::* add valid() method and boolean cast shorthand.  Also reset() and operator<<(ostream, ...)
+ - Add pvac::GetEvent::valid to determine fields actually transfered during a Get operation.
+ - Add pvac::ClientProvider::name()
+ - Add epics::pvAccess::MonitorFIFO utility implementation of epics::pvAccess::Monitor
+ - Add pvas::StaticProvider, pvas::DynamicProvider, and pvas::SharedPV.  See @ref pvas
+ - Support in the 'ca' provider for new pvRequest options:
+   - New `DBE` record option to select CA events to monitor, containing any combination of the keywords `VALUE`, `ARCHIVE`, `ALARM` and/or `PROPERTY`.
+   - New `dbtype` field option to represent data types returned by CA as an unsigned or 64-bit integer.
+   - New `pvtype=pvString` field option to represent an array of chars from CA as a string.
+
+Release 6.0.0 (Dec 2017)
+========================
 
 - Incompatible changes
  - Requires pvDataCPP >=7.0.0 due to headers moved from pvDataCPP into this module: requester.h, destoryable.h, and monitor.h

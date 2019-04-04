@@ -34,7 +34,7 @@ ServerChannel::ServerChannel(Channel::shared_pointer const & channel,
     }
 }
 
-void ServerChannel::registerRequest(const pvAccessID id, Destroyable::shared_pointer const & request)
+void ServerChannel::registerRequest(const pvAccessID id, const std::tr1::shared_ptr<BaseChannelRequester> & request)
 {
     Lock guard(_mutex);
     if(_destroyed) throw std::logic_error("Can't registerRequest() for destory'd server channel");
@@ -51,7 +51,7 @@ void ServerChannel::unregisterRequest(const pvAccessID id)
     }
 }
 
-Destroyable::shared_pointer ServerChannel::getRequest(const pvAccessID id)
+std::tr1::shared_ptr<BaseChannelRequester> ServerChannel::getRequest(const pvAccessID id)
 {
     Lock guard(_mutex);
     _requests_t::iterator iter = _requests.find(id);
@@ -59,21 +59,34 @@ Destroyable::shared_pointer ServerChannel::getRequest(const pvAccessID id)
     {
         return iter->second;
     }
-    return Destroyable::shared_pointer();
+    return BaseChannelRequester::shared_pointer();
 }
 
 void ServerChannel::destroy()
 {
-    Lock guard(_mutex);
-
-    if (_destroyed) return;
-    _destroyed = true;
-
-    // destroy all requests
-    // take ownership of _requests locally to prevent
-    // removal via unregisterRequest() during iteration
     _requests_t reqs;
-    _requests.swap(reqs);
+    {
+        Lock guard(_mutex);
+
+        if (_destroyed) return;
+        _destroyed = true;
+
+        // destroy all requests
+        // take ownership of _requests locally to prevent
+        // removal via unregisterRequest() during iteration
+        _requests.swap(reqs);
+
+        // close channel security session
+        // TODO try catch
+        _channelSecuritySession->close();
+
+        // ... and the channel
+        // TODO try catch
+        _channel->destroy();
+    }
+    // unlock our before destroy.
+    // our mutex is subordinate to operation mutex
+
     for(_requests_t::const_iterator it=reqs.begin(), end=reqs.end(); it!=end; ++it)
     {
         const _requests_t::mapped_type& req = it->second;
@@ -81,14 +94,6 @@ void ServerChannel::destroy()
         req->destroy();
         // May still be in the send queue
     }
-
-    // close channel security session
-    // TODO try catch
-    _channelSecuritySession->close();
-
-    // ... and the channel
-    // TODO try catch
-    _channel->destroy();
 }
 
 ServerChannel::~ServerChannel()

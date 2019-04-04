@@ -2,11 +2,6 @@
 * testCodec.cpp
 */
 
-#if defined(_WIN32) && !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-
-
 #include <epicsExit.h>
 #include <epicsUnitTest.h>
 #include <testMain.h>
@@ -113,6 +108,9 @@ public:
         _writeBuffer(sendBufferSize),
         _dummyAddress()
     {
+        dummyAddr.ia.sin_family = AF_INET;
+        dummyAddr.ia.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        dummyAddr.ia.sin_port = htons(42);
     }
 
 
@@ -352,8 +350,8 @@ public:
         return std::string("TCP");
     }
 
-    const osiSockAddr* getRemoteAddress() const  {
-        return 0;
+    const osiSockAddr& getRemoteAddress() const  {
+        return dummyAddr;
     }
     std::string dummyRemoteName;
     const std::string& getRemoteName() const {
@@ -412,6 +410,7 @@ public:
     }
 
 
+    osiSockAddr dummyAddr;
     std::size_t _closedCount;
     std::size_t _invalidDataStreamCount;
     std::size_t _scheduleSendCount;

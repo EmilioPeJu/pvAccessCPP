@@ -9,6 +9,7 @@
 
 #include <string>
 
+#include <compilerDependencies.h>
 #include <shareLib.h>
 
 namespace epics {
@@ -37,7 +38,7 @@ OFF
 */
 
 
-epicsShareFunc void pvAccessLog(pvAccessLogLevel level, const char* format, ...);
+epicsShareFunc void pvAccessLog(pvAccessLogLevel level, const char* format, ...) EPICS_PRINTF_STYLE(2, 3);
 epicsShareFunc void pvAccessSetLogLevel(pvAccessLogLevel level);
 epicsShareFunc bool pvAccessIsLoggable(pvAccessLogLevel level);
 
@@ -65,7 +66,7 @@ epicsShareFunc bool pvAccessIsLoggable(pvAccessLogLevel level);
     * @param[in] fname The file to write to. If the file exists, it
     * is opened for append.
     */
-epicsShareFunc void createFileLogger( std::string const & fname );
+epicsShareFunc void createFileLogger( std::string const & fname ) EPICS_DEPRECATED;
 
 }
 }

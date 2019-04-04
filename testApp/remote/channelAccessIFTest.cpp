@@ -32,17 +32,17 @@ namespace TR1 = std::tr1;
 
 
 // int value, 1Hz increment by one
-std::string ChannelAccessIFTest::TEST_COUNTER_CHANNEL_NAME = "testCounter";
+const std::string ChannelAccessIFTest::TEST_COUNTER_CHANNEL_NAME = "testCounter";
 // int value, increment on process
-std::string ChannelAccessIFTest::TEST_SIMPLECOUNTER_CHANNEL_NAME = "testSimpleCounter";
+const std::string ChannelAccessIFTest::TEST_SIMPLECOUNTER_CHANNEL_NAME = "testSimpleCounter";
 // double value, NTScalar
-std::string ChannelAccessIFTest::TEST_CHANNEL_NAME = "testValue";
+const std::string ChannelAccessIFTest::TEST_CHANNEL_NAME = "testValue";
 // double value
-std::string ChannelAccessIFTest::TEST_VALUEONLY_CHANNEL_NAME = "testValueOnly";
+const std::string ChannelAccessIFTest::TEST_VALUEONLY_CHANNEL_NAME = "testValueOnly";
 // RPC sum service: int a + int b -> int c
-std::string ChannelAccessIFTest::TEST_SUMRPC_CHANNEL_NAME = "testSum";
+const std::string ChannelAccessIFTest::TEST_SUMRPC_CHANNEL_NAME = "testSum";
 // double[] value
-std::string ChannelAccessIFTest::TEST_ARRAY_CHANNEL_NAME = "testArray1";
+const std::string ChannelAccessIFTest::TEST_ARRAY_CHANNEL_NAME = "testArray1";
 
 #ifdef ENABLE_STRESS_TESTS
 #define EXTRA_STRESS_TESTS 5
@@ -628,9 +628,9 @@ void ChannelAccessIFTest::test_channelGetIntProcessInternal(Channel::shared_poin
         pvTimeStamp.get(timeStamp);
         double deltaT = TimeStamp::diff(timeStamp, previousTimestamp);
 
-        testOk((previousValue +1)/*%11*/ == value->get(), "%s: testing the counter value change",
-               testMethodName.c_str());
-        testOk(deltaT > 0.9 && deltaT < 2.0,
+        testOk((previousValue +1) == value->get(), "%s: testing the counter value change %d == %d",
+               testMethodName.c_str(), previousValue +1, (int)value->get());
+        testOk(deltaT > 0.1 && deltaT < 20.0,
                "%s: timestamp change was %g", testMethodName.c_str(), deltaT);
     }
 
@@ -1608,9 +1608,9 @@ void ChannelAccessIFTest::test_channelPutGetIntProcess() {
 
         //cout << "Testing1:" << testValue << " == " << getValuePtr->get() << endl;
         //cout << "Testing2:" << timeStamp.getSecondsPastEpoch() << ">" << previousTimestampSec << endl;
-        testOk( testValue == getValuePtr->get(), "%s: testing the counter value change",
-                CURRENT_FUNCTION);
-        testOk(deltaT > 0.9 && deltaT < 2.0,
+        testOk( testValue == getValuePtr->get(), "%s: testing the counter value change %d == %d",
+                CURRENT_FUNCTION, testValue, (int)getValuePtr->get());
+        testOk(deltaT > 0.1 && deltaT < 20.0,
                "%s: timestamp change is %g", CURRENT_FUNCTION, deltaT);
     }
 

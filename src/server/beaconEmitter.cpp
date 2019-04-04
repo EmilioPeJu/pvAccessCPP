@@ -4,10 +4,6 @@
  * in file LICENSE that is included with this distribution.
  */
 
-#if defined(_WIN32) && !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-
 #include <algorithm>
 
 #define epicsExportSharedSymbols
@@ -66,7 +62,7 @@ void BeaconEmitter::send(ByteBuffer* buffer, TransportSendControl* control)
     }
 
     // send beacon
-    control->startMessage((int8)0, 12+2+2+16+2);
+    control->startMessage((int8)CMD_BEACON, 12+2+2+16+2);
 
     buffer->put(_guid.value, 0, sizeof(_guid.value));
 
@@ -109,12 +105,16 @@ void BeaconEmitter::timerStopped()
 
 void BeaconEmitter::destroy()
 {
-    _timer->cancel(shared_from_this());
+    Timer::shared_pointer timer(_timer.lock());
+    if(timer)
+        timer->cancel(shared_from_this());
 }
 
 void BeaconEmitter::start()
 {
-    _timer->scheduleAfterDelay(shared_from_this(), 0.0);
+    Timer::shared_pointer timer(_timer.lock());
+    if(timer)
+        timer->scheduleAfterDelay(shared_from_this(), 0.0);
 }
 
 void BeaconEmitter::reschedule()
@@ -122,7 +122,9 @@ void BeaconEmitter::reschedule()
     const double period = (_beaconSequenceID >= _beaconCountLimit) ? _slowBeaconPeriod : _fastBeaconPeriod;
     if (period > 0)
     {
-        _timer->scheduleAfterDelay(shared_from_this(), period);
+        Timer::shared_pointer timer(_timer.lock());
+        if(timer)
+            timer->scheduleAfterDelay(shared_from_this(), period);
     }
 }
 

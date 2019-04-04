@@ -11,6 +11,9 @@
 #include <stdexcept>
 
 #include <osiSock.h>
+#include <epicsGuard.h>
+#include <epicsAssert.h>
+
 #include <pv/lock.h>
 #include <pv/timer.h>
 #include <pv/bitSetUtil.h>
@@ -22,14 +25,13 @@
 #include <pv/pvaConstants.h>
 #include <pv/blockingUDP.h>
 #include <pv/blockingTCP.h>
-#include <pv/namedLockPattern.h>
 #include <pv/inetAddressUtil.h>
 #include <pv/hexDump.h>
 #include <pv/remote.h>
 #include <pv/codec.h>
 #include <pv/channelSearchManager.h>
 #include <pv/serializationHelper.h>
-#include <pv/simpleChannelSearchManagerImpl.h>
+#include <pv/channelSearchManager.h>
 #include <pv/clientContextImpl.h>
 #include <pv/configuration.h>
 #include <pv/beaconHandler.h>
@@ -53,7 +55,6 @@ Status ClientChannelImpl::channelDestroyed(
     Status::STATUSTYPE_WARNING, "channel destroyed");
 Status ClientChannelImpl::channelDisconnected(
     Status::STATUSTYPE_WARNING, "channel disconnected");
-string emptyString;
 
 }}
 namespace {
@@ -66,13 +67,9 @@ class ChannelGetFieldRequestImpl;
 typedef std::map<pvAccessID, ResponseRequest::weak_pointer> IOIDResponseRequestMap;
 
 
-#define EXCEPTION_GUARD(code) try { code; } \
-        catch (std::exception &e) { LOG(logLevelError, "Unhandled exception caught from client code at %s:%d: %s", __FILE__, __LINE__, e.what()); } \
-                catch (...) { LOG(logLevelError, "Unhandled exception caught from client code at %s:%d.", __FILE__, __LINE__); }
+#define EXCEPTION_GUARD(code) do { code; } while(0)
 
-#define EXCEPTION_GUARD3(WEAK, PTR, code) {requester_type::shared_pointer PTR((WEAK).lock()); if(PTR) try { code; } \
-        catch (std::exception &e) { LOG(logLevelError, "Unhandled exception caught from client code at %s:%d: %s", __FILE__, __LINE__, e.what()); } \
-                catch (...) { LOG(logLevelError, "Unhandled exception caught from client code at %s:%d.", __FILE__, __LINE__); }}
+#define EXCEPTION_GUARD3(WEAK, PTR, code) do{requester_type::shared_pointer PTR((WEAK).lock()); if(PTR) { code; }}while(0)
 
 #define SEND_MESSAGE(WEAK, PTR, MSG, MTYPE) \
 do{requester_type::shared_pointer PTR((WEAK).lock()); if(PTR) (PTR)->message(MSG, MTYPE); }while(0)
@@ -105,6 +102,7 @@ public:
         PVStructure::shared_pointer const & pvStructure,
         BitSet::shared_pointer const & existingBitSet)
     {
+        assert(pvStructure);
         int pvStructureSize = pvStructure->getNumberFields();
         if (existingBitSet.get() && static_cast<int32>(existingBitSet->size()) >= pvStructureSize)
         {
@@ -271,41 +269,32 @@ public:
         Status status;
         status.deserialize(payloadBuffer, transport.get());
 
-        try
+        if (qos & QOS_INIT)
         {
-            if (qos & QOS_INIT)
+            if (status.isSuccess())
             {
-                if (status.isSuccess())
-                {
-                    // once created set destroy flag
-                    Lock G(m_mutex);
-                    m_initialized = true;
-                }
-
-                initResponse(transport, version, payloadBuffer, qos, status);
+                // once created set destroy flag
+                Lock G(m_mutex);
+                m_initialized = true;
             }
-            else
+
+            initResponse(transport, version, payloadBuffer, qos, status);
+        }
+        else
+        {
+            bool destroyReq = false;
+
+            if (qos & QOS_DESTROY)
             {
-                bool destroyReq = false;
-
-                if (qos & QOS_DESTROY)
-                {
-                    Lock G(m_mutex);
-                    m_initialized = false;
-                    destroyReq = true;
-                }
-
-                normalResponse(transport, version, payloadBuffer, qos, status);
-
-                if (destroyReq)
-                    destroy();
+                Lock G(m_mutex);
+                m_initialized = false;
+                destroyReq = true;
             }
-        }
-        catch (std::exception &e) {
-            LOG(logLevelError, "Unhandled exception caught from client code at %s:%d: %s", __FILE__, __LINE__, e.what());
-        }
-        catch (...) {
-            LOG(logLevelError, "Unhandled exception caught from client code at %s:%d.", __FILE__, __LINE__);
+
+            normalResponse(transport, version, payloadBuffer, qos, status);
+
+            if (destroyReq)
+                destroy();
         }
     }
 
@@ -321,6 +310,8 @@ public:
         {
             startRequest(PURE_CANCEL_REQUEST);
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<BaseRequestImpl>());
+        } catch (std::runtime_error& e) {
+            // assume from checkAndGetTransport() due to wrong channel state
         } catch (std::exception& e) {
             // noop (do not complain if fails)
             LOG(logLevelWarn, "Ignore exception during ChanneGet::cancel: %s", e.what());
@@ -916,6 +907,7 @@ public:
             }
         }
 
+        // TODO: m_structure and m_bitSet guarded by m_structureMutex?  (as below)
         if (!(*m_structure->getStructure() == *pvPutStructure->getStructure()))
         {
             EXCEPTION_GUARD3(m_callback, cb, cb->putDone(invalidPutStructureStatus, thisPtr));
@@ -934,10 +926,11 @@ public:
         }
 
         try {
-            lock();
-            *m_bitSet = *pvPutBitSet;
-            m_structure->copyUnchecked(*pvPutStructure, *m_bitSet);
-            unlock();
+            {
+                epicsGuard<ChannelPutImpl> G(*this);
+                *m_bitSet = *pvPutBitSet;
+                m_structure->copyUnchecked(*pvPutStructure, *m_bitSet);
+            }
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<ChannelPutImpl>());
         } catch (std::runtime_error &rte) {
             abortRequest();
@@ -1183,10 +1176,11 @@ public:
         }
 
         try {
-            lock();
-            *m_putDataBitSet = *bitSet;
-            m_putData->copyUnchecked(*pvPutStructure, *m_putDataBitSet);
-            unlock();
+            {
+                epicsGuard<ChannelPutGetImpl> G(*this);
+                *m_putDataBitSet = *bitSet;
+                m_putData->copyUnchecked(*pvPutStructure, *m_putDataBitSet);
+            }
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<ChannelPutGetImpl>());
         } catch (std::runtime_error &rte) {
             abortRequest();
@@ -1421,9 +1415,10 @@ public:
         }
 
         try {
-            m_structureMutex.lock();
-            m_structure = pvArgument;
-            m_structureMutex.unlock();
+            {
+                epicsGuard<epicsMutex> G(m_structureMutex);
+                m_structure = pvArgument;
+            }
 
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<ChannelRPCImpl>());
         } catch (std::runtime_error &rte) {
@@ -1845,9 +1840,6 @@ private:
     MonitorElement::shared_pointer m_overrunElement;
     bool m_overrunInProgress;
 
-
-    MonitorElement::shared_pointer m_nullMonitorElement;
-
     PVStructure::shared_pointer m_up2datePVStructure;
 
     int32 m_releasedCount;
@@ -1873,7 +1865,6 @@ public:
         m_monitorQueue(),
         m_callback(callback), m_mutex(),
         m_bitSet1(), m_bitSet2(), m_overrunInProgress(false),
-        m_nullMonitorElement(),
         m_releasedCount(0),
         m_reportQueueStateInProgress(false),
         m_channel(channel), m_ioid(ioid),
@@ -2008,10 +1999,10 @@ public:
                 guard.unlock();
                 EXCEPTION_GUARD3(m_callback, cb, cb->unlisten(shared_from_this()));
             }
-            return m_nullMonitorElement;
+            return MonitorElement::shared_pointer();
         }
 
-        MonitorElement::shared_pointer retVal = m_monitorQueue.front();
+        MonitorElement::shared_pointer retVal(m_monitorQueue.front());
         m_monitorQueue.pop();
         return retVal;
     }
@@ -2056,14 +2047,18 @@ public:
 
             if (sendAck)
             {
+                guard.unlock();
+
                 try
                 {
                     m_channel->checkAndGetTransport()->enqueueSendRequest(shared_from_this());
                 } catch (std::runtime_error&) {
                     // assume wrong connection state from checkAndGetTransport()
+                    guard.lock();
                     m_reportQueueStateInProgress = false;
                 } catch (std::exception& e) {
                     LOG(logLevelWarn, "Ignore exception during MonitorStrategyQueue::release: %s", e.what());
+                    guard.lock();
                     m_reportQueueStateInProgress = false;
                 }
             }
@@ -2388,12 +2383,19 @@ public:
         if (!startRequest(QOS_PROCESS | QOS_GET))
             return BaseRequestImpl::otherRequestPendingStatus;
 
+        bool restore = m_started;
+        m_started = true;
+
+        guard.unlock();
+
         try
         {
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<ChannelMonitorImpl>());
-            m_started = true;
             return Status::Ok;
         } catch (std::runtime_error &rte) {
+            guard.lock();
+
+            m_started = restore;
             abortRequest();
             return BaseRequestImpl::channelNotConnected;
         }
@@ -2414,12 +2416,19 @@ public:
         if (!startRequest(QOS_PROCESS))
             return BaseRequestImpl::otherRequestPendingStatus;
 
+        bool restore = m_started;
+        m_started = false;
+
+        guard.unlock();
+
         try
         {
             m_channel->checkAndGetTransport()->enqueueSendRequest(internal_from_this<ChannelMonitorImpl>());
-            m_started = false;
             return Status::Ok;
         } catch (std::runtime_error &rte) {
+            guard.lock();
+
+            m_started = restore;
             abortRequest();
             return BaseRequestImpl::channelNotConnected;
         }
@@ -2446,8 +2455,9 @@ public:
 
 
 class AbstractClientResponseHandler : public ResponseHandler {
+    EPICS_NOT_COPYABLE(AbstractClientResponseHandler)
 protected:
-    ClientContextImpl::weak_pointer _context;
+    const ClientContextImpl::weak_pointer _context;
 public:
     AbstractClientResponseHandler(ClientContextImpl::shared_pointer const & context, string const & description) :
         ResponseHandler(context.get(), description), _context(ClientContextImpl::weak_pointer(context)) {
@@ -2457,7 +2467,7 @@ public:
     }
 };
 
-class NoopResponse : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class NoopResponse : public AbstractClientResponseHandler {
 public:
     NoopResponse(ClientContextImpl::shared_pointer const & context, string const & description) :
         AbstractClientResponseHandler(context, description)
@@ -2469,7 +2479,7 @@ public:
 };
 
 
-class ResponseRequestHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class ResponseRequestHandler : public AbstractClientResponseHandler {
 public:
     ResponseRequestHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Data response")
@@ -2488,17 +2498,19 @@ public:
         transport->ensureData(4);
         // TODO check and optimize?
         ResponseRequest::shared_pointer rr = _context.lock()->getResponseRequest(payloadBuffer->getInt());
-        if (rr.get())
+        if (rr)
         {
-            ResponseRequest::shared_pointer nrr = dynamic_pointer_cast<ResponseRequest>(rr);
-            if (nrr.get())
-                nrr->response(transport, version, payloadBuffer);
+            rr->response(transport, version, payloadBuffer);
+        } else {
+            // oh no, we can't complete parsing this message!
+            // This might contain updates to our introspectionRegistry, which will lead to failures later on.
+            // TODO: seperate message parsing from user Operation lifetime...
         }
     }
 };
 
 
-class MultipleResponseRequestHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class MultipleResponseRequestHandler : public AbstractClientResponseHandler {
 public:
     MultipleResponseRequestHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Multiple data response")
@@ -2526,13 +2538,9 @@ public:
                 return;
 
             ResponseRequest::shared_pointer rr = context->getResponseRequest(ioid);
-            if (rr.get())
+            if (rr)
             {
-                ResponseRequest::shared_pointer nrr = dynamic_pointer_cast<ResponseRequest>(rr);
-                if (nrr.get())
-                    nrr->response(transport, version, payloadBuffer);
-                else
-                    return; // we cannot deserialize, we are lost in stream, we must stop
+                rr->response(transport, version, payloadBuffer);
             }
             else
                 return; // we cannot deserialize, we are lost in stream, we must stop
@@ -2540,7 +2548,7 @@ public:
     }
 };
 
-class SearchResponseHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class SearchResponseHandler : public AbstractClientResponseHandler {
 public:
     SearchResponseHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Search response")
@@ -2587,7 +2595,10 @@ public:
 
         // reads CIDs
         // TODO optimize
-        std::tr1::shared_ptr<epics::pvAccess::ChannelSearchManager> csm = _context.lock()->getChannelSearchManager();
+        ClientContextImpl::shared_pointer context(_context.lock());
+        if(!context)
+            return;
+        std::tr1::shared_ptr<epics::pvAccess::ChannelSearchManager> csm = context->getChannelSearchManager();
         int16 count = payloadBuffer->getShort();
         for (int i = 0; i < count; i++)
         {
@@ -2600,7 +2611,7 @@ public:
     }
 };
 
-class SearchHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class SearchHandler : public AbstractClientResponseHandler {
 public:
     SearchHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Search")
@@ -2689,7 +2700,7 @@ public:
     }
 };
 
-class BeaconResponseHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class BeaconResponseHandler : public AbstractClientResponseHandler {
 public:
     BeaconResponseHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Beacon")
@@ -2731,14 +2742,16 @@ public:
         int16 port = payloadBuffer->getShort();
         serverAddress.ia.sin_port = htons(port);
 
-        string protocol = SerializeHelper::deserializeString(payloadBuffer, transport.get());
+        string protocol(SerializeHelper::deserializeString(payloadBuffer, transport.get()));
+        if(protocol!="tcp")
+            return;
 
         // TODO optimize
         ClientContextImpl::shared_pointer context = _context.lock();
         if (!context)
             return;
 
-        std::tr1::shared_ptr<epics::pvAccess::BeaconHandler> beaconHandler = context->getBeaconHandler(protocol, responseFrom);
+        std::tr1::shared_ptr<epics::pvAccess::BeaconHandler> beaconHandler = context->getBeaconHandler(responseFrom);
         // currently we care only for servers used by this context
         if (!beaconHandler)
             return;
@@ -2757,7 +2770,7 @@ public:
     }
 };
 
-class ClientConnectionValidationHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class ClientConnectionValidationHandler : public AbstractClientResponseHandler {
 public:
     ClientConnectionValidationHandler(ClientContextImpl::shared_pointer context) :
         AbstractClientResponseHandler(context, "Connection validation")
@@ -2797,7 +2810,7 @@ public:
     }
 };
 
-class ClientConnectionValidatedHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class ClientConnectionValidatedHandler : public AbstractClientResponseHandler {
 public:
     ClientConnectionValidatedHandler(ClientContextImpl::shared_pointer context) :
         AbstractClientResponseHandler(context, "Connection validated")
@@ -2818,7 +2831,7 @@ public:
     }
 };
 
-class MessageHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class MessageHandler : public AbstractClientResponseHandler {
 public:
     MessageHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Message")
@@ -2853,7 +2866,7 @@ public:
     }
 };
 
-class CreateChannelHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class CreateChannelHandler : public AbstractClientResponseHandler {
 public:
     CreateChannelHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Create channel")
@@ -2903,7 +2916,7 @@ public:
 };
 
 
-class DestroyChannelHandler : public AbstractClientResponseHandler, private epics::pvData::NoDefaultMethods {
+class DestroyChannelHandler : public AbstractClientResponseHandler {
 public:
     DestroyChannelHandler(ClientContextImpl::shared_pointer const & context) :
         AbstractClientResponseHandler(context, "Destroy channel")
@@ -2933,7 +2946,8 @@ public:
  * PVA response handler - main handler which dispatches responses to appripriate handlers.
  * @author <a href="mailto:matej.sekoranjaATcosylab.com">Matej Sekoranja</a>
  */
-class ClientResponseHandler : public ResponseHandler, private epics::pvData::NoDefaultMethods {
+class ClientResponseHandler : public ResponseHandler {
+    EPICS_NOT_COPYABLE(ClientResponseHandler)
 private:
 
     /**
@@ -3072,7 +3086,7 @@ public:
         ChannelRequester::shared_pointer const & channelRequester,
         short priority) OVERRIDE FINAL
     {
-        return createChannel(channelName, channelRequester, priority, emptyString);
+        return createChannel(channelName, channelRequester, priority, std::string());
     }
 
     virtual Channel::shared_pointer createChannel(
@@ -3281,7 +3295,44 @@ private:
 
         virtual void destroy() OVERRIDE FINAL
         {
-            destroy(false);
+            // Hack.  Prevent Transport from being dtor'd while m_channelMutex is held
+            Transport::shared_pointer old_transport;
+            {
+                Lock guard(m_channelMutex);
+                if (m_connectionState == DESTROYED)
+                    return;
+                REFTRACE_DECREMENT(num_active);
+
+                old_transport = m_transport;
+
+                m_getfield.reset();
+
+                // stop searching...
+                shared_pointer thisChannelPointer = internal_from_this();
+                m_context->getChannelSearchManager()->unregisterSearchInstance(thisChannelPointer);
+
+                disconnectPendingIO(true);
+
+                if (m_connectionState == CONNECTED)
+                {
+                    disconnect(false, true);
+                }
+                else if (m_transport)
+                {
+                    // unresponsive state, do not forget to release transport
+                    m_transport->release(getID());
+                    m_transport.reset();
+                }
+
+
+                setConnectionState(DESTROYED);
+
+                // unregister
+                m_context->unregisterChannel(thisChannelPointer);
+            }
+
+            // should be called without any lock hold
+            reportChannelStateChange();
         }
 
         virtual string getRequesterName() OVERRIDE FINAL
@@ -3351,7 +3402,7 @@ public:
             return m_channelID;
         }
 
-        virtual string getSearchInstanceName() OVERRIDE FINAL {
+        virtual const string& getSearchInstanceName() OVERRIDE FINAL {
             return m_name;
         }
 
@@ -3384,7 +3435,11 @@ public:
 
         void disconnect() {
             {
+                // Hack.  Prevent Transport from being dtor'd while m_channelMutex is held
+                Transport::shared_pointer old_transport;
                 Lock guard(m_channelMutex);
+                old_transport = m_transport;
+
                 // if not destroyed...
                 if (m_connectionState == DESTROYED)
                     throw std::runtime_error("Channel destroyed.");
@@ -3396,42 +3451,6 @@ public:
             reportChannelStateChange();
         }
 
-        /**
-         * Create a channel, i.e. submit create channel request to the server.
-         * This method is called after search is complete.
-         * @param transport
-         */
-        void createChannel(Transport::shared_pointer const & transport)
-        {
-            Lock guard(m_channelMutex);
-
-            // do not allow duplicate creation to the same transport
-            if (!m_allowCreation)
-                return;
-            m_allowCreation = false;
-
-            // check existing transport
-            if (m_transport.get() && m_transport.get() != transport.get())
-            {
-                disconnectPendingIO(false);
-
-                m_transport->release(getID());
-            }
-            else if (m_transport.get() == transport.get())
-            {
-                // request to sent create request to same transport, ignore
-                // this happens when server is slower (processing search requests) than client generating it
-                return;
-            }
-
-            m_transport = transport;
-            m_transport->enqueueSendRequest(internal_from_this());
-        }
-
-        virtual void cancel() {
-            // noop
-        }
-
         virtual void timeout() {
             createChannelFailed();
         }
@@ -3441,15 +3460,14 @@ public:
          */
         virtual void createChannelFailed() OVERRIDE FINAL
         {
+            // Hack.  Prevent Transport from being dtor'd while m_channelMutex is held
+            Transport::shared_pointer old_transport;
             Lock guard(m_channelMutex);
-
-            cancel();
-
             // release transport if active
             if (m_transport)
             {
                 m_transport->release(getID());
-                m_transport.reset();
+                old_transport.swap(m_transport);
             }
 
             // ... and search again, with penalty
@@ -3472,7 +3490,6 @@ public:
                     if (m_connectionState == DESTROYED)
                     {
                         // end connection request
-                        cancel();
                         return;
                     }
 
@@ -3492,71 +3509,6 @@ public:
                     LOG(logLevelError, "connectionCompleted() %d '%s' unhandled exception: %s\n", sid, m_name.c_str(), e.what());
                     // noop
                 }
-
-                // NOTE: always call cancel
-                // end connection request
-                cancel();
-            }
-
-            // should be called without any lock hold
-            reportChannelStateChange();
-        }
-
-        /**
-         * @param force force destruction regardless of reference count (not used now)
-         */
-        void destroy(bool force) {
-            {
-                Lock guard(m_channelMutex);
-                if (m_connectionState == DESTROYED)
-                    return;
-                //throw std::runtime_error("Channel already destroyed.");
-            }
-            REFTRACE_DECREMENT(num_active);
-
-            destroyChannel(force);
-        }
-
-
-        /**
-         * Actual destroy method, to be called <code>CAJContext</code>.
-         * @param force force destruction regardless of reference count
-         * @throws PVAException
-         * @throws std::runtime_error
-         * @throws IOException
-         */
-        void destroyChannel(bool /*force*/) OVERRIDE FINAL {
-            {
-                Lock guard(m_channelMutex);
-
-                if (m_connectionState == DESTROYED)
-                    throw std::runtime_error("Channel already destroyed.");
-
-                m_getfield.reset();
-
-                // stop searching...
-                shared_pointer thisChannelPointer = internal_from_this();
-                m_context->getChannelSearchManager()->unregisterSearchInstance(thisChannelPointer);
-                cancel();
-
-                disconnectPendingIO(true);
-
-                if (m_connectionState == CONNECTED)
-                {
-                    disconnect(false, true);
-                }
-                else if (m_transport)
-                {
-                    // unresponsive state, do not forget to release transport
-                    m_transport->release(getID());
-                    m_transport.reset();
-                }
-
-
-                setConnectionState(DESTROYED);
-
-                // unregister
-                m_context->unregisterChannel(thisChannelPointer);
             }
 
             // should be called without any lock hold
@@ -3580,7 +3532,6 @@ public:
             if (!initiateSearch) {
                 // stop searching...
                 m_context->getChannelSearchManager()->unregisterSearchInstance(internal_from_this());
-                cancel();
             }
             setConnectionState(DISCONNECTED);
 
@@ -3656,17 +3607,20 @@ public:
         }
 
         virtual void searchResponse(const ServerGUID & guid, int8 minorRevision, osiSockAddr* serverAddress) OVERRIDE FINAL {
+            // Hack.  Prevent Transport from being dtor'd while m_channelMutex is held
+            Transport::shared_pointer old_transport;
+
             Lock guard(m_channelMutex);
-            Transport::shared_pointer transport = m_transport;
-            if (transport.get())
+            Transport::shared_pointer transport(m_transport);
+            if (transport)
             {
                 // GUID check case: same server listening on different NIF
 
-                if (!sockAddrAreIdentical(transport->getRemoteAddress(), serverAddress) &&
+                if (!sockAddrAreIdentical(&transport->getRemoteAddress(), serverAddress) &&
                         !std::equal(guid.value, guid.value + 12, m_guid.value))
                 {
                     EXCEPTION_GUARD3(m_requester, req, req->message("More than one channel with name '" + m_name +
-                                                         "' detected, connected to: " + inetAddressToString(*transport->getRemoteAddress()) + ", ignored: " + inetAddressToString(*serverAddress), warningMessage));
+                                                         "' detected, connected to: " + inetAddressToString(transport->getRemoteAddress()) + ", ignored: " + inetAddressToString(*serverAddress), warningMessage));
                 }
 
                 // do not pass (create transports) with we already have one
@@ -3675,7 +3629,7 @@ public:
 
             // NOTE: this creates a new or acquires an existing transport (implies increases usage count)
             transport = m_context->getTransport(internal_from_this(), serverAddress, minorRevision, m_priority);
-            if (!transport.get())
+            if (!transport)
             {
                 createChannelFailed();
                 return;
@@ -3686,7 +3640,34 @@ public:
             std::copy(guid.value, guid.value + 12, m_guid.value);
 
             // create channel
-            createChannel(transport);
+            {
+                Lock guard(m_channelMutex);
+
+                // do not allow duplicate creation to the same transport
+                if (!m_allowCreation)
+                    return;
+                m_allowCreation = false;
+
+                // check existing transport
+                if (m_transport && m_transport.get() != transport.get())
+                {
+                    disconnectPendingIO(false);
+
+                    m_transport->release(getID());
+                }
+                else if (m_transport.get() == transport.get())
+                {
+                    // request to sent create request to same transport, ignore
+                    // this happens when server is slower (processing search requests) than client generating it
+                    return;
+                }
+
+                // rotate: transport -> m_transport -> old_transport ->
+                old_transport.swap(m_transport);
+                m_transport.swap(transport);
+
+                m_transport->enqueueSendRequest(internal_from_this());
+            }
         }
 
         virtual void transportClosed() OVERRIDE FINAL {
@@ -3827,7 +3808,9 @@ public:
                     for(size_t i=0, N=ops.size(); i<N; i++) {
                         ResponseRequest::shared_pointer R(ops[i].lock());
                         if(!R) continue;
-                        EXCEPTION_GUARD(R->getRequester()->channelDisconnect(connectionState==Channel::DESTROYED);)
+                        ChannelBaseRequester::shared_pointer req(R->getRequester());
+                        if(!req) continue;
+                        EXCEPTION_GUARD(req->channelDisconnect(connectionState==Channel::DESTROYED););
                     }
                 }
             }
@@ -4018,8 +4001,7 @@ public:
                   EPICS_PVA_MAINTENANCE_VERSION,
                   EPICS_PVA_DEVELOPMENT_FLAG),
         m_contextState(CONTEXT_NOT_INITIALIZED),
-        m_configuration(conf),
-        m_flushStrategy(DELAYED)
+        m_configuration(conf)
     {
         REFTRACE_INCREMENT(num_instances);
 
@@ -4104,18 +4086,40 @@ public:
             m_contextState = CONTEXT_DESTROYED;
         }
 
-        internalDestroy();
-    }
+        //
+        // cleanup
+        //
 
-    virtual void dispose() OVERRIDE FINAL
-    {
-        try {
-            destroy();
-        } catch (std::exception& ex) {
-            printf("dispose(): %s\n", ex.what()); // tODO remove
-        } catch (...) {
-            /* TODO log with low level */
+        m_timer->close();
+
+        m_channelSearchManager->cancel();
+
+        // this will also close all PVA transports
+        destroyAllChannels();
+
+        // stop UDPs
+        for (BlockingUDPTransportVector::const_iterator iter = m_udpTransports.begin();
+                iter != m_udpTransports.end(); iter++)
+            (*iter)->close();
+        m_udpTransports.clear();
+
+        // stop UDPs
+        if (m_searchTransport)
+            m_searchTransport->close();
+
+        // wait for all transports to cleanly exit
+        int tries = 40;
+        epics::pvData::int32 transportCount;
+        while ((transportCount = m_transportRegistry.size()) && tries--)
+            epicsThreadSleep(0.025);
+
+        {
+            Lock guard(m_beaconMapMutex);
+            m_beaconHandlers.clear();
         }
+
+        if (transportCount)
+            LOG(logLevelDebug, "PVA client context destroyed with %u transport(s) active.", (unsigned)transportCount);
     }
 
     virtual ~InternalClientContextImpl()
@@ -4151,12 +4155,14 @@ private:
 
         osiSockAttach();
         m_timer.reset(new Timer("pvAccess-client timer", lowPriority));
-        InternalClientContextImpl::shared_pointer thisPointer = internal_from_this();
+        InternalClientContextImpl::shared_pointer thisPointer(internal_from_this());
         // stores weak_ptr
         m_connector.reset(new BlockingTCPConnector(thisPointer, m_receiveBufferSize, m_connectionTimeout));
 
         // stores many weak_ptr
         m_responseHandler.reset(new ClientResponseHandler(thisPointer));
+
+        m_channelSearchManager.reset(new ChannelSearchManager(thisPointer));
 
         // preinitialize security plugins
         SecurityPluginRegistry::instance();
@@ -4164,73 +4170,32 @@ private:
         // TODO put memory barrier here... (if not already called within a lock?)
 
         // setup UDP transport
-        initializeUDPTransport();
+        {
+
+            // query broadcast addresses of all IFs
+            SOCKET socket = epicsSocketCreate(AF_INET, SOCK_DGRAM, 0);
+            if (socket == INVALID_SOCKET)
+            {
+                throw std::logic_error("Failed to create a socket to introspect network interfaces.");
+            }
+
+            IfaceNodeVector ifaceList;
+            if (discoverInterfaces(ifaceList, socket, 0) || ifaceList.size() == 0)
+            {
+                LOG(logLevelError, "Failed to introspect interfaces or no network interfaces available.");
+            }
+            epicsSocketDestroy (socket);
+
+            initializeUDPTransports(false, m_udpTransports, ifaceList, m_responseHandler, m_searchTransport,
+                                    m_broadcastPort, m_autoAddressList, m_addressList, std::string());
+
+        }
 
         // setup search manager
-        m_channelSearchManager = SimpleChannelSearchManagerImpl::create(thisPointer);
+        // Starts timer
+        m_channelSearchManager->activate();
 
         // TODO what if initialization failed!!!
-    }
-
-    /**
-     * Initialized UDP transport (broadcast socket and repeater connection).
-     */
-    bool initializeUDPTransport() {
-
-        // query broadcast addresses of all IFs
-        SOCKET socket = epicsSocketCreate(AF_INET, SOCK_DGRAM, 0);
-        if (socket == INVALID_SOCKET)
-        {
-            LOG(logLevelError, "Failed to create a socket to introspect network interfaces.");
-            return false;
-        }
-
-        IfaceNodeVector ifaceList;
-        if (discoverInterfaces(ifaceList, socket, 0) || ifaceList.size() == 0)
-        {
-            LOG(logLevelError, "Failed to introspect interfaces or no network interfaces available.");
-            return false;
-        }
-        epicsSocketDestroy (socket);
-
-        initializeUDPTransports(false, m_udpTransports, ifaceList, m_responseHandler, m_searchTransport,
-                                m_broadcastPort, m_autoAddressList, m_addressList, std::string());
-
-        return true;
-    }
-
-    void internalDestroy() {
-
-        //
-        // cleanup
-        //
-
-        // this will also close all PVA transports
-        destroyAllChannels();
-
-        // stop UDPs
-        for (BlockingUDPTransportVector::const_iterator iter = m_udpTransports.begin();
-                iter != m_udpTransports.end(); iter++)
-            (*iter)->close();
-        m_udpTransports.clear();
-
-        // stop UDPs
-        if (m_searchTransport)
-            m_searchTransport->close();
-
-        // wait for all transports to cleanly exit
-        int tries = 40;
-        epics::pvData::int32 transportCount;
-        while ((transportCount = m_transportRegistry.numberOfActiveTransports()) && tries--)
-            epicsThreadSleep(0.025);
-
-        {
-            Lock guard(m_beaconMapMutex);
-            m_beaconHandlers.clear();
-        }
-
-        if (transportCount)
-            LOG(logLevelDebug, "PVA client context destroyed with %d transport(s) active.", transportCount);
     }
 
     void destroyAllChannels() {
@@ -4416,19 +4381,15 @@ private:
      * @param responseFrom remote source address of received beacon.
      * @return beacon handler for particular server.
      */
-    BeaconHandler::shared_pointer getBeaconHandler(std::string const & protocol, osiSockAddr* responseFrom) OVERRIDE FINAL
+    BeaconHandler::shared_pointer getBeaconHandler(osiSockAddr* responseFrom) OVERRIDE FINAL
     {
-        // TODO !!! protocol !!!
-        if (protocol != "tcp")
-            return BeaconHandler::shared_pointer();
-
         Lock guard(m_beaconMapMutex);
         AddressBeaconHandlerMap::iterator it = m_beaconHandlers.find(*responseFrom);
         BeaconHandler::shared_pointer handler;
         if (it == m_beaconHandlers.end())
         {
             // stores weak_ptr
-            handler.reset(new BeaconHandler(internal_from_this(), protocol, responseFrom));
+            handler.reset(new BeaconHandler(internal_from_this(), responseFrom));
             m_beaconHandlers[*responseFrom] = handler;
         }
         else
@@ -4447,13 +4408,11 @@ private:
         try
         {
             Transport::shared_pointer t = m_connector->connect(client, m_responseHandler, *serverAddress, minorRevision, priority);
-            // TODO !!!
-            //static_pointer_cast<BlockingTCPTransport>(t)->setFlushStrategy(m_flushStrategy);
             return t;
         }
         catch (std::exception& e)
         {
-            LOG(logLevelError, "getTransport() fails: %s\n", e.what());
+            LOG(logLevelDebug, "getTransport() fails: %s", e.what());
             return Transport::shared_pointer();
         }
     }
@@ -4475,66 +4434,21 @@ private:
         if (priority < ChannelProvider::PRIORITY_MIN || priority > ChannelProvider::PRIORITY_MAX)
             throw std::range_error("priority out of bounds");
 
-        bool lockAcquired = true; // TODO namedLocker->acquireSynchronizationObject(name, LOCK_TIMEOUT);
-        if (lockAcquired)
-        {
-            try
-            {
-                /* Note that our channels have an internal ref. to us.
-                 * Thus having active channels will *not* keep us alive.
-                 * Use code must explicitly keep our external ref. as well
-                 * as our channels.
-                 */
-                pvAccessID cid = generateCID();
-                return InternalChannelImpl::create(internal_from_this(), cid, name, requester, priority, addresses);
-            }
-            catch(std::exception& e) {
-                LOG(logLevelError, "createChannelInternal() exception: %s\n", e.what());
-                return ClientChannelImpl::shared_pointer();
-            }
-            // TODO namedLocker.releaseSynchronizationObject(name);
-        }
-        else
-        {
-            // TODO is this OK?
-            throw std::runtime_error("Failed to obtain synchronization lock for '" + name + "', possible deadlock.");
+        try {
+            /* Note that our channels have an internal ref. to us.
+             * Thus having active channels will *not* keep us alive.
+             * Use code must explicitly keep our external ref. as well
+             * as our channels.
+             */
+            pvAccessID cid = generateCID();
+            return InternalChannelImpl::create(internal_from_this(), cid, name, requester, priority, addresses);
+        } catch(std::exception& e) {
+            LOG(logLevelError, "createChannelInternal() exception: %s\n", e.what());
+            return ClientChannelImpl::shared_pointer();
         }
     }
 
-    virtual void configure(epics::pvData::PVStructure::shared_pointer configuration) OVERRIDE FINAL
-    {   // remove?
-        if (m_transportRegistry.numberOfActiveTransports() > 0)
-            throw std::runtime_error("Configure must be called when there is no transports active.");
-
-        PVInt::shared_pointer pvStrategy = dynamic_pointer_cast<PVInt>(configuration->getSubField("strategy"));
-        if (pvStrategy.get())
-        {
-            int32 value = pvStrategy->get();
-            switch (value)
-            {
-            case IMMEDIATE:
-            case DELAYED:
-            case USER_CONTROLED:
-                m_flushStrategy = static_cast<FlushStrategy>(value);
-                break;
-            default:
-                // TODO report warning
-                break;
-            }
-        }
-
-    }
-
-    virtual void flush() OVERRIDE FINAL
-    {
-        m_transportRegistry.toArray(m_flushTransports);
-        TransportRegistry::transportVector_t::const_iterator iter = m_flushTransports.begin();
-        while (iter != m_flushTransports.end())
-            (*iter++)->flushSendQueue();
-        m_flushTransports.clear();
-    }
-
-    std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> >& getSecurityPlugins() OVERRIDE FINAL
+    const securityPlugins_t& getSecurityPlugins() OVERRIDE FINAL
     {
         return SecurityPluginRegistry::instance().getClientSecurityPlugins();
     }
@@ -4684,8 +4598,6 @@ private:
     Configuration::shared_pointer m_configuration;
 
     TransportRegistry::transportVector_t m_flushTransports;
-
-    FlushStrategy m_flushStrategy;
 };
 
 size_t InternalClientContextImpl::num_instances;

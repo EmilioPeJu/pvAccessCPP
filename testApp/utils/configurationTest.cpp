@@ -20,31 +20,8 @@
 #include <epicsUnitTest.h>
 #include <testMain.h>
 
-#ifdef _WIN32
-void setenv(char * a, char * b, int c)
-{
-    char buf[1024];
-    sprintf(buf, "%s=%s", a, b);
-    _putenv(buf);
-}
-#endif
-
 using namespace epics::pvAccess;
 using namespace epics::pvData;
-
-static const char indata[] =
-    "hello =    world  \n"
-    "  # oops\n"
-    " #dd=da\n"
-    " empty =  \n"
-    " this   =   is a test\n\n"
-    ;
-
-static const char expectdata[] =
-    "empty = \n"
-    "hello = world\n"
-    "this = is a test\n"
-    ;
 
 static void showEnv(const char *name)
 {

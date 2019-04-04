@@ -5,6 +5,7 @@
 #ifndef PVATESTCLIENT_H
 #define PVATESTCLIENT_H
 
+#include <ostream>
 #include <stdexcept>
 #include <list>
 
@@ -53,6 +54,7 @@ struct epicsShareClass Operation
         virtual ~Impl() {}
         virtual std::string name() const =0;
         virtual void cancel() =0;
+        virtual void show(std::ostream&) const =0;
     };
 
     Operation() {}
@@ -64,20 +66,33 @@ struct epicsShareClass Operation
     //! Does not wait for remote confirmation.
     void cancel();
 
+    bool valid() const { return !!impl; }
+
+#if __cplusplus>=201103L
+    explicit operator bool() const { return valid(); }
+#else
+private:
+    typedef bool (Operation::*bool_type)() const;
+public:
+    operator bool_type() const { return valid() ? &Operation::valid : 0; }
+#endif
+
+    void reset() { impl.reset(); }
+
 protected:
+    friend epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const Operation& op);
     std::tr1::shared_ptr<Impl> impl;
 };
 
 //! Information on put completion
-struct PutEvent
+struct epicsShareClass PutEvent
 {
     enum event_t {
         Fail,    //!< request ends in failure.  Check message
         Cancel,  //!< request cancelled before completion
         Success, //!< It worked!
     } event;
-    std::string message;
-    void *priv;
+    std::string message; //!< Check when event==Fail
 };
 
 //! Information on get/rpc completion
@@ -85,6 +100,15 @@ struct epicsShareClass GetEvent : public PutEvent
 {
     //! New data. NULL unless event==Success
     epics::pvData::PVStructure::const_shared_pointer value;
+    //! Mask of fields in value which have been initialized by the server
+    //! @since 6.1.0
+    epics::pvData::BitSet::const_shared_pointer valid;
+};
+
+struct epicsShareClass InfoEvent : public PutEvent
+{
+    //! Type description resulting from getField operation.  NULL unless event==Success
+    epics::pvData::FieldConstPtr type;
 };
 
 struct MonitorSync;
@@ -104,19 +128,51 @@ struct epicsShareClass Monitor
     void cancel();
     /** updates root, changed, overrun
      *
-     * @return true if root!=NULL
+     * @return true if a new update was extracted from the queue.
+     * @note This method does not block.
      * @note MonitorEvent::Data will not be repeated until poll()==false.
+     * @post root!=NULL (after version 6.0.0)
+     * @post root!=NULL iff poll()==true  (In version 6.0.0)
      */
     bool poll();
     //! true if all events received.
     //! Check after poll()==false
     bool complete() const;
+    /** Monitor update data.
+     *
+     * After version 6.0.0
+     *
+     * Initially NULL, becomes !NULL the first time poll()==true.
+     * The PVStructure pointed to be root will presist until
+     * Monitor reconnect w/ type change.  This can be detected
+     * by comparing `root.get()`.  references to root may be cached
+     * subject to this test.
+     *
+     * In version 6.0.0
+     *
+     * NULL except after poll()==true.  poll()==false sets root=NULL.
+     * references to root should not be stored between calls to poll().
+     */
     epics::pvData::PVStructure::const_shared_pointer root;
     epics::pvData::BitSet changed,
                           overrun;
 
+    bool valid() const { return !!impl; }
+
+#if __cplusplus>=201103L
+    explicit operator bool() const { return valid(); }
+#else
+private:
+    typedef bool (Monitor::*bool_type)() const;
+public:
+    operator bool_type() const { return valid() ? &Monitor::valid : 0; }
+#endif
+
+    void reset() { impl.reset(); }
+
 private:
     std::tr1::shared_ptr<Impl> impl;
+    friend epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const Monitor& op);
     friend struct MonitorSync;
 };
 
@@ -126,18 +182,22 @@ struct MonitorEvent
     enum event_t {
         Fail=1,      //!< subscription ends in an error
         Cancel=2,    //!< subscription ends in cancellation
-        Disconnect=4,//!< subscription interrupted to do lose of communication
+        Disconnect=4,//!< subscription interrupted due to loss of communication
         Data=8,      //!< Data queue not empty.  Call Monitor::poll()
     } event;
-    std::string message; // set for event=Fail
+    std::string message; //!< set for event=Fail
 };
 
 /** Subscription usable w/o callbacks
  *
- * Basic usage is to call wait().
+ * Basic usage is to call wait() or test().
  * If true is returned, then the 'event', 'root', 'changed', and 'overrun'
  * members have been updated with a new event.
  * Test 'event.event' first to find out which kind of event has occured.
+ *
+ * Note that wait()/test() methods are distinct from base class poll().
+ * wait()/test() check for the arrival of MonitorEvent
+ * while poll() checks for the availability of data (eg. following a Data event).
  */
 struct epicsShareClass MonitorSync : public Monitor
 {
@@ -147,15 +207,19 @@ struct epicsShareClass MonitorSync : public Monitor
     ~MonitorSync();
 
     //! wait for new event
+    //! @returns true when a new event was received.
+    //!          false if wake() was called.
     bool wait();
     //! wait for new event
     //! @return false on timeout
     bool wait(double timeout);
-    //! check if new event is available
+    //! check if new event is immediately available.
+    //! Does not block.
     bool test();
 
-    //! Abort one call to wait()
-    //! wait() will return with MonitorEvent::Fail
+    //! Abort one call to wait(), either concurrent or future.
+    //! Calls are queued.
+    //! wait() will return with MonitorEvent::Fail.
     void wake();
 
     //! most recent event
@@ -168,7 +232,11 @@ private:
 //! information on connect/disconnect
 struct ConnectEvent
 {
+    //! Is this a connection, or disconnection, event.
     bool connected;
+    //! For connection events.  This is the name provided by the peer (cf. epics::pvAccess::Channel::getRemoteAddress() ).
+    //! @since >6.1.0
+    std::string peerName;
 };
 
 //! Thrown by blocking methods of ClientChannel on operation timeout
@@ -202,6 +270,7 @@ private:
     std::tr1::shared_ptr<Impl> impl;
     friend class ClientProvider;
     friend void detail::registerRefTrack();
+    friend epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const ClientChannel& op);
 
     ClientChannel(const std::tr1::shared_ptr<Impl>& i) :impl(i) {}
 public:
@@ -228,6 +297,19 @@ public:
 
     //! Channel name or an empty string
     std::string name() const;
+
+    bool valid() const { return !!impl; }
+
+#if __cplusplus>=201103L
+    explicit operator bool() const { return valid(); }
+#else
+private:
+    typedef bool (ClientChannel::*bool_type)() const;
+public:
+    operator bool_type() const { return valid() ? &ClientChannel::valid : 0; }
+#endif
+
+    void reset() { impl.reset(); }
 
     //! callback for get() and rpc()
     struct GetCallback {
@@ -272,9 +354,20 @@ public:
     struct PutCallback {
         virtual ~PutCallback() {}
         struct Args {
-            Args(epics::pvData::BitSet& tosend) :tosend(tosend) {}
+            Args(epics::pvData::BitSet& tosend, epics::pvData::BitSet& previousmask) :tosend(tosend), previousmask(previousmask) {}
+            //! Callee must fill this in with an instance of the Structure passed as the 'build' argument.
             epics::pvData::PVStructure::const_shared_pointer root;
+            //! Callee must set bits corresponding to the fields of 'root' which will actually be sent.
             epics::pvData::BitSet& tosend;
+            //! A previous value of the PV being "put" when put(..., getprevious=true).  eg. use to find enumeration value.
+            //! Otherwise NULL.
+            //! @note The value of the PV may change between the point where "previous" is fetched,
+            //!       and when this Put operation completes.
+            //! @since 6.1.0 Added after 6.0.0
+            epics::pvData::PVStructure::const_shared_pointer previous;
+            //! Bit mask indicating those fields of 'previous' which have been set by the server.  (others have local defaults)
+            //! Unused if previous==NULL.
+            const epics::pvData::BitSet& previousmask;
         };
         /** Server provides expected structure.
          *
@@ -290,9 +383,13 @@ public:
 
     //! Initiate request to change PV
     //! @param cb Completion notification callback.  Must outlive Operation (call Operation::cancel() to force release)
-    //! TODO: produce bitset to mask fields being set
+    //! @param pvRequest if NULL defaults to "field()".
+    //! @param getprevious If true, fetch a previous value of the PV and make
+    //!                    this available as PutCallback::Args::previous and previousmask.
+    //!                    If false, then previous=NULL
     Operation put(PutCallback* cb,
-                      epics::pvData::PVStructure::const_shared_pointer pvRequest = epics::pvData::PVStructure::const_shared_pointer());
+                  epics::pvData::PVStructure::const_shared_pointer pvRequest = epics::pvData::PVStructure::const_shared_pointer(),
+                  bool getprevious = false);
 
     //! Synchronious put operation
     inline
@@ -312,7 +409,7 @@ public:
     };
 
     //! Begin subscription
-    //! @param cb Completion notification callback.  Must outlive Operation (call Operation::cancel() to force release)
+    //! @param cb Completion notification callback.  Must outlive Monitor (call Monitor::cancel() to force release)
     Monitor monitor(MonitorCallback *cb,
                           epics::pvData::PVStructure::const_shared_pointer pvRequest = epics::pvData::PVStructure::const_shared_pointer());
 
@@ -329,6 +426,20 @@ public:
     MonitorSync monitor(const epics::pvData::PVStructure::const_shared_pointer& pvRequest = epics::pvData::PVStructure::const_shared_pointer(),
                         epicsEvent *event =0);
 
+    struct InfoCallback {
+        virtual ~InfoCallback() {}
+        //! getField operation is complete
+        virtual void infoDone(const InfoEvent& evt) =0;
+    };
+
+    //! Request PV type info.
+    //! @note This type may not be the same as the types used in the get/put/monitor operations.
+    Operation info(InfoCallback *cb, const std::string& subfld = std::string());
+
+    //! Synchronious getField opreation
+    epics::pvData::FieldConstPtr info(double timeout = 3.0,
+                                      const std::string& subfld = std::string());
+
     //! Connection state change CB
     struct ConnectCallback {
         virtual ~ConnectCallback() {}
@@ -340,6 +451,7 @@ public:
     //! Remove from list of listeners
     void removeConnectListener(ConnectCallback*);
 
+    void show(std::ostream& strm) const;
 private:
     std::tr1::shared_ptr<epics::pvAccess::Channel> getChannel();
 };
@@ -403,8 +515,11 @@ class epicsShareClass ClientProvider
     struct Impl;
     std::tr1::shared_ptr<Impl> impl;
     friend void detail::registerRefTrack();
+    friend epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const ClientProvider& op);
 public:
 
+    //! Construct a null provider.  All methods throw.  May later be assigned from a valid ClientProvider
+    ClientProvider() {}
     /** Use named provider.
      *
      * @param providerName ChannelProvider name, may be prefixed with "clients:" or "servers:" to query
@@ -416,6 +531,8 @@ public:
                    const std::tr1::shared_ptr<epics::pvAccess::Configuration>& conf = std::tr1::shared_ptr<epics::pvAccess::Configuration>());
     explicit ClientProvider(const std::tr1::shared_ptr<epics::pvAccess::ChannelProvider>& provider);
     ~ClientProvider();
+
+    std::string name() const;
 
     /** Get a new Channel
      *
@@ -432,6 +549,19 @@ public:
 
     //! Clear channel cache
     void disconnect();
+
+    bool valid() const { return !!impl; }
+
+#if __cplusplus>=201103L
+    explicit operator bool() const { return valid(); }
+#else
+private:
+    typedef bool (ClientProvider::*bool_type)() const;
+public:
+    operator bool_type() const { return valid() ? &ClientProvider::valid : 0; }
+#endif
+
+    void reset() { impl.reset(); }
 };
 
 
@@ -441,6 +571,11 @@ ClientChannel::put(const epics::pvData::PVStructure::const_shared_pointer& pvReq
 {
     return detail::PutBuilder(*this, pvRequest);
 }
+
+epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const Operation& op);
+epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const Monitor& op);
+epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const ClientChannel& op);
+epicsShareFunc ::std::ostream& operator<<(::std::ostream& strm, const ClientProvider& op);
 
 //! @}
 

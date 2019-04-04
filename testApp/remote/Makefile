@@ -10,6 +10,7 @@ TESTS += testChannelAccess
 TESTPROD_HOST += testCodec
 testCodec_SRCS = testCodec
 testHarness_SRCS += testCodec.cpp
+testCodec_SYS_LIBS_WIN32 += ws2_32
 TESTS += testCodec
 
 TESTPROD_HOST += testRPC
@@ -26,29 +27,36 @@ TESTPROD_HOST += testServerContext
 testServerContext_SRCS += testServerContext.cpp
 TESTS += testServerContext
 
+TESTPROD_HOST += testmonitorfifo
+testmonitorfifo_SRCS += testmonitorfifo.cpp
+TESTS += testmonitorfifo
 
-PROD_HOST += testServer
+TESTPROD_HOST += testsharedstate
+testsharedstate_SRCS += testsharedstate.cpp
+TESTS += testsharedstate
+
+TESTPROD_HOST += testServer
 testServer_SRCS += testServer.cpp
 
-PROD_HOST += testGetPerformance
+TESTPROD_HOST += testGetPerformance
 testGetPerformance_SRCS += testGetPerformance.cpp
 
-PROD_HOST += testMonitorPerformance
+TESTPROD_HOST += testMonitorPerformance
 testMonitorPerformance_SRCS += testMonitorPerformance.cpp
 
-PROD_HOST += rpcServiceExample
+TESTPROD_HOST += rpcServiceExample
 rpcServiceExample_SRCS += rpcServiceExample.cpp
 
-PROD_HOST += rpcServiceAsyncExample
+TESTPROD_HOST += rpcServiceAsyncExample
 rpcServiceAsyncExample_SRCS += rpcServiceAsyncExample.cpp
 
-PROD_HOST += rpcWildServiceExample
+TESTPROD_HOST += rpcWildServiceExample
 rpcWildServiceExample_SRCS += rpcWildServiceExample.cpp
 
-PROD_HOST += rpcClientExample
+TESTPROD_HOST += rpcClientExample
 rpcClientExample_SRCS += rpcClientExample.cpp
 
-PROD_HOST += pipelineServiceExample
+TEESTPROD_HOST += pipelineServiceExample
 pipelineServiceExample_SRCS += pipelineServiceExample.cpp
 
 TESTPROD_HOST += testClientFactory

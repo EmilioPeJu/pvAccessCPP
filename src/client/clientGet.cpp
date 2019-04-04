@@ -6,6 +6,7 @@
 #include <epicsMutex.h>
 #include <epicsGuard.h>
 #include <epicsEvent.h>
+#include <epicsThread.h>
 
 #include <pv/current_function.h>
 #include <pv/pvData.h>
@@ -17,50 +18,43 @@
 #include "clientpvt.h"
 #include "pv/pvAccess.h"
 
-namespace pvd = epics::pvData;
-namespace pva = epics::pvAccess;
-typedef epicsGuard<epicsMutex> Guard;
-typedef epicsGuardRelease<epicsMutex> UnGuard;
-
 namespace {
+using pvac::detail::CallbackGuard;
+using pvac::detail::CallbackUse;
 
-struct GetPutter : public pva::ChannelPutRequester,
-                   public pvac::Operation::Impl,
-                   public pvac::detail::wrapped_shared_from_this<GetPutter>
+struct Getter : public pvac::detail::CallbackStorage,
+                public pva::ChannelGetRequester,
+                public pvac::Operation::Impl,
+                public pvac::detail::wrapped_shared_from_this<Getter>
 {
-    mutable epicsMutex mutex;
-
-    bool started;
     operation_type::shared_pointer op;
 
-    pvac::ClientChannel::GetCallback *getcb;
-    pvac::ClientChannel::PutCallback *putcb;
+    pvac::ClientChannel::GetCallback *cb;
     pvac::GetEvent event;
 
     static size_t num_instances;
 
-    GetPutter(pvac::ClientChannel::GetCallback* cb) :started(false), getcb(cb), putcb(0)
+    explicit Getter(pvac::ClientChannel::GetCallback* cb) :cb(cb)
     {REFTRACE_INCREMENT(num_instances);}
-    GetPutter(pvac::ClientChannel::PutCallback* cb) :started(false), getcb(0), putcb(cb)
-    {REFTRACE_INCREMENT(num_instances);}
-    virtual ~GetPutter() {REFTRACE_DECREMENT(num_instances);}
+    virtual ~Getter() {
+        CallbackGuard G(*this);
+        cb = 0;
+        G.wait(); // paranoia
+        REFTRACE_DECREMENT(num_instances);
+    }
 
-    void callEvent(Guard& G, pvac::GetEvent::event_t evt = pvac::GetEvent::Fail)
+    void callEvent(CallbackGuard& G, pvac::GetEvent::event_t evt = pvac::GetEvent::Fail)
     {
-        if(!putcb && !getcb) return;
+        if(!cb) return;
 
         event.event = evt;
-        if(putcb) {
-            pvac::ClientChannel::PutCallback *cb=putcb;
-            putcb = 0;
-            UnGuard U(G);
-            cb->putDone(event);
-        }
-        if(getcb) {
-            pvac::ClientChannel::GetCallback *cb=getcb;
-            getcb = 0;
-            UnGuard U(G);
-            cb->getDone(event);
+        pvac::ClientChannel::GetCallback *C=cb;
+        cb = 0;
+        CallbackUse U(G);
+        try {
+            C->getDone(event);
+        } catch(std::exception& e) {
+            LOG(pva::logLevelInfo, "Lost exception during getDone(): %s", e.what());
         }
     }
 
@@ -73,9 +67,12 @@ struct GetPutter : public pva::ChannelPutRequester,
     // called automatically via wrapped_shared_from_this
     virtual void cancel() OVERRIDE FINAL
     {
-        Guard G(mutex);
-        if(started && op) op->cancel();
+        // keepalive for safety in case callback wants to destroy us
+        std::tr1::shared_ptr<Getter> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
+        if(op) op->cancel();
         callEvent(G, pvac::GetEvent::Cancel);
+        G.wait();
     }
 
     virtual std::string getRequesterName() OVERRIDE FINAL
@@ -84,14 +81,14 @@ struct GetPutter : public pva::ChannelPutRequester,
         return op ? op->getChannel()->getRequesterName() : "<dead>";
     }
 
-    virtual void channelPutConnect(
+    virtual void channelGetConnect(
         const epics::pvData::Status& status,
-        pva::ChannelPut::shared_pointer const & channelPut,
+        pva::ChannelGet::shared_pointer const & channelGet,
         epics::pvData::Structure::const_shared_pointer const & structure) OVERRIDE FINAL
     {
-        Guard G(mutex);
-        if(started) return;
-        if(!putcb && !getcb) return;
+        std::tr1::shared_ptr<Getter> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
+        if(!cb) return;
 
         if(!status.isOK()) {
             event.message = status.getMessage();
@@ -101,71 +98,29 @@ struct GetPutter : public pva::ChannelPutRequester,
         if(!status.isSuccess()) {
             callEvent(G);
 
-        } else if(getcb){
-            channelPut->lastRequest();
-            channelPut->get();
-            started = true;
+        } else {
+            channelGet->get();
 
-        } else if(putcb){
-            pvac::ClientChannel::PutCallback *cb(putcb);
-            pvd::BitSet::shared_pointer tosend(new pvd::BitSet);
-            pvac::ClientChannel::PutCallback::Args args(*tosend);
-            try {
-                UnGuard U(G);
-                cb->putBuild(structure, args);
-                if(!args.root)
-                    throw std::logic_error("No put value provided");
-                else if(args.root->getStructure().get()!=structure.get())
-                    throw std::logic_error("Provided put value with wrong type");
-            }catch(std::exception& e){
-                if(putcb) {
-                    event.message = e.what();
-                    callEvent(G);
-                } else {
-                    LOG(pva::logLevelInfo, "Lost exception in %s: %s", CURRENT_FUNCTION, e.what());
-                }
-            }
-            // check putcb again after UnGuard
-            if(putcb) {
-                channelPut->lastRequest();
-                channelPut->put(std::tr1::const_pointer_cast<pvd::PVStructure>(args.root), tosend);
-                started = true;
-            }
         }
     }
 
     virtual void channelDisconnect(bool destroy) OVERRIDE FINAL
     {
-        Guard G(mutex);
+        CallbackGuard G(*this);
         event.message = "Disconnect";
 
         callEvent(G);
     }
 
-    virtual void putDone(
-        const epics::pvData::Status& status,
-        pva::ChannelPut::shared_pointer const & channelPut) OVERRIDE FINAL
-    {
-        Guard G(mutex);
-        if(!putcb) return;
-
-        if(!status.isOK()) {
-            event.message = status.getMessage();
-        } else {
-            event.message.clear();
-        }
-
-        callEvent(G, status.isSuccess()? pvac::GetEvent::Success : pvac::GetEvent::Fail);
-    }
-
     virtual void getDone(
         const epics::pvData::Status& status,
-        pva::ChannelPut::shared_pointer const & channelPut,
+        pva::ChannelGet::shared_pointer const & channelGet,
         epics::pvData::PVStructure::shared_pointer const & pvStructure,
         epics::pvData::BitSet::shared_pointer const & bitSet) OVERRIDE FINAL
     {
-        Guard G(mutex);
-        if(!getcb) return;
+        std::tr1::shared_ptr<Getter> keepalive(internal_shared_from_this());
+        CallbackGuard G(*this);
+        if(!cb) return;
 
         if(!status.isOK()) {
             event.message = status.getMessage();
@@ -173,13 +128,20 @@ struct GetPutter : public pva::ChannelPutRequester,
             event.message.clear();
         }
         event.value = pvStructure;
-        // assume bitSet->get(0)==true as we only make one request
+        event.valid = bitSet;
 
         callEvent(G, status.isSuccess()? pvac::GetEvent::Success : pvac::GetEvent::Fail);
     }
+
+    virtual void show(std::ostream &strm) const
+    {
+        strm << "Operation(Get"
+                "\"" << name() <<"\""
+             ")";
+    }
 };
 
-size_t GetPutter::num_instances;
+size_t Getter::num_instances;
 
 } //namespace
 
@@ -193,42 +155,22 @@ ClientChannel::get(ClientChannel::GetCallback* cb,
     if(!pvRequest)
         pvRequest = pvd::createRequest("field()");
 
-    std::tr1::shared_ptr<GetPutter> ret(GetPutter::build(cb));
+    std::tr1::shared_ptr<Getter> ret(Getter::build(cb));
 
     {
         Guard G(ret->mutex);
-        ret->op = getChannel()->createChannelPut(ret->internal_shared_from_this(),
+        ret->op = getChannel()->createChannelGet(ret->internal_shared_from_this(),
                                                  std::tr1::const_pointer_cast<pvd::PVStructure>(pvRequest));
     }
 
     return Operation(ret);
-}
-
-Operation
-ClientChannel::put(PutCallback* cb,
-                  epics::pvData::PVStructure::const_shared_pointer pvRequest)
-{
-    if(!impl) throw std::logic_error("Dead Channel");
-    if(!pvRequest)
-        pvRequest = pvd::createRequest("field()");
-
-    std::tr1::shared_ptr<GetPutter> ret(GetPutter::build(cb));
-
-    {
-        Guard G(ret->mutex);
-        ret->op = getChannel()->createChannelPut(ret->internal_shared_from_this(),
-                                                 std::tr1::const_pointer_cast<pvd::PVStructure>(pvRequest));
-    }
-
-    return Operation(ret);
-
 }
 
 namespace detail {
 
 void registerRefTrackGet()
 {
-    epics::registerRefCounter("pvac::GetPutter", &GetPutter::num_instances);
+    epics::registerRefCounter("pvac::Getter", &Getter::num_instances);
 }
 
 }

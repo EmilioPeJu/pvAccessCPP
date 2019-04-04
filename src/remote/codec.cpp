@@ -4,11 +4,6 @@
 * in file LICENSE that is included with this distribution.
 */
 
-#if defined(_WIN32) && !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-
-
 #include <map>
 #include <string>
 #include <vector>
@@ -33,7 +28,6 @@
 #include <pv/blockingTCP.h>
 #include <pv/remote.h>
 #include <pv/inetAddressUtil.h>
-#include <pv/namedLockPattern.h>
 #include <pv/hexDump.h>
 #include <pv/logger.h>
 #include <pv/likely.h>
@@ -59,6 +53,19 @@ struct BreakTransport : TransportSender
 
 namespace epics {
 namespace pvAccess {
+
+size_t Transport::num_instances;
+
+Transport::Transport()
+{
+    REFTRACE_INCREMENT(num_instances);
+}
+
+Transport::~Transport()
+{
+    REFTRACE_DECREMENT(num_instances);
+}
+
 namespace detail {
 
 const std::size_t AbstractCodec::MAX_MESSAGE_PROCESS = 100;
@@ -325,7 +332,7 @@ void AbstractCodec::processReadSegmented() {
                     " %s:%d: %s, disconnecting...",
                     __FILE__, __LINE__, inetAddressToString(*getLastReadBufferSocketAddress()).c_str());
                 invalidDataStreamHandler();
-                throw new invalid_data_stream_exception(
+                throw invalid_data_stream_exception(
                     "not-a-first segmented message expected");
             }
 
@@ -995,6 +1002,7 @@ bool AbstractCodec::directDeserialize(ByteBuffer *existingBuffer, char* deserial
 {
     return false;
 }
+
 //
 //
 //  BlockingAbstractCodec
@@ -1027,14 +1035,11 @@ void BlockingTCPTransportCodec::close() {
         // wakeup processSendQueue
 
         // clean resources (close socket)
-        internalClose(true);
+        internalClose();
 
         // Break sender from queue wait
         BreakTransport::shared_pointer B(new BreakTransport);
         enqueueSendRequest(B);
-
-        // post close
-        internalPostClose(true);
     }
 }
 
@@ -1045,9 +1050,42 @@ void BlockingTCPTransportCodec::waitJoin()
     _readThread.exitWait();
 }
 
-void BlockingTCPTransportCodec::internalClose(bool /*force*/)
+void BlockingTCPTransportCodec::internalClose()
 {
-    this->internalDestroy();
+    {
+
+        epicsSocketSystemCallInterruptMechanismQueryInfo info  =
+            epicsSocketSystemCallInterruptMechanismQuery ();
+        switch ( info )
+        {
+        case esscimqi_socketCloseRequired:
+            epicsSocketDestroy ( _channel );
+            break;
+        case esscimqi_socketBothShutdownRequired:
+        {
+            /*int status =*/ ::shutdown ( _channel, SHUT_RDWR );
+            /*
+            if ( status ) {
+                char sockErrBuf[64];
+                epicsSocketConvertErrnoToString (
+                    sockErrBuf, sizeof ( sockErrBuf ) );
+            LOG(logLevelDebug,
+                "TCP socket to %s failed to shutdown: %s.",
+                inetAddressToString(_socketAddress).c_str(), sockErrBuf);
+            }
+            */
+            epicsSocketDestroy ( _channel );
+        }
+        break;
+        case esscimqi_socketSigAlarmRequired:
+        // not supported anymore anyway
+        default:
+            epicsSocketDestroy(_channel);
+        }
+    }
+
+    Transport::shared_pointer thisSharedPtr = this->shared_from_this();
+    _context->getTransportRegistry()->remove(thisSharedPtr);
 
     // TODO sync
     if (_securitySession)
@@ -1083,13 +1121,24 @@ void BlockingTCPTransportCodec::start() {
 
 void BlockingTCPTransportCodec::receiveThread()
 {
-    Transport::shared_pointer ptr = this->shared_from_this();
+    /* This innocuous ref. is an important hack.
+     * The code behind Transport::close() will cause
+     * channels and operations to drop references
+     * to this transport.  This ref. keeps it from
+     * being destroyed way down the call stack, from
+     * which it is apparently not possible to return
+     * safely.  Rather than try to untangle this
+     * knot, just keep this ref...
+     */
+    Transport::shared_pointer ptr(this->shared_from_this());
 
     while (this->isOpen())
     {
         try {
             this->processRead();
+            continue;
         } catch (std::exception &e) {
+            PRINT_EXCEPTION(e);
             LOG(logLevelError,
                 "an exception caught while in receiveThread at %s:%d: %s",
                 __FILE__, __LINE__, e.what());
@@ -1098,15 +1147,16 @@ void BlockingTCPTransportCodec::receiveThread()
                 "unknown exception caught while in receiveThread at %s:%d.",
                 __FILE__, __LINE__);
         }
+        // exception
+        close();
     }
-
-    this->_shutdownEvent.signal();
 }
 
 
 void BlockingTCPTransportCodec::sendThread()
 {
-    Transport::shared_pointer ptr = this->shared_from_this();
+    // cf. the comment in receiveThread()
+    Transport::shared_pointer ptr(this->shared_from_this());
 
     this->setSenderThread();
 
@@ -1114,9 +1164,11 @@ void BlockingTCPTransportCodec::sendThread()
     {
         try {
             this->processWrite();
+            continue;
         } catch (connection_closed_exception &cce) {
             // noop
         } catch (std::exception &e) {
+            PRINT_EXCEPTION(e);
             LOG(logLevelWarn,
                 "an exception caught while in sendThread at %s:%d: %s",
                 __FILE__, __LINE__, e.what());
@@ -1125,6 +1177,8 @@ void BlockingTCPTransportCodec::sendThread()
                 "unknown exception caught while in sendThread at %s:%d.",
                 __FILE__, __LINE__);
         }
+        // exception
+        close();
     }
     _sendQueue.clear();
 }
@@ -1158,10 +1212,12 @@ BlockingTCPTransportCodec::BlockingTCPTransportCodec(bool serverFlag, const Cont
     ,_readThread(epics::pvData::Thread::Config(this, &BlockingTCPTransportCodec::receiveThread)
                  .prio(epicsThreadPriorityCAServerLow)
                  .name("TCP-rx")
+                 .stack(epicsThreadStackBig)
                  .autostart(false))
     ,_sendThread(epics::pvData::Thread::Config(this, &BlockingTCPTransportCodec::sendThread)
                  .prio(epicsThreadPriorityCAServerLow)
                  .name("TCP-tx")
+                 .stack(epicsThreadStackBig)
                  .autostart(false))
     ,_channel(channel)
     ,_context(context), _responseHandler(responseHandler)
@@ -1189,47 +1245,6 @@ BlockingTCPTransportCodec::BlockingTCPTransportCodec(bool serverFlag, const Cont
         _socketName = ipAddrStr;
     }
 
-}
-
-// must be called only once, when there will be no operation on socket (e.g. just before tx/rx thread exists)
-void BlockingTCPTransportCodec::internalDestroy() {
-
-    if(_channel != INVALID_SOCKET) {
-
-        epicsSocketSystemCallInterruptMechanismQueryInfo info  =
-            epicsSocketSystemCallInterruptMechanismQuery ();
-        switch ( info )
-        {
-        case esscimqi_socketCloseRequired:
-            epicsSocketDestroy ( _channel );
-            break;
-        case esscimqi_socketBothShutdownRequired:
-        {
-            /*int status =*/ ::shutdown ( _channel, SHUT_RDWR );
-            /*
-            if ( status ) {
-                char sockErrBuf[64];
-                epicsSocketConvertErrnoToString (
-                    sockErrBuf, sizeof ( sockErrBuf ) );
-            LOG(logLevelDebug,
-                "TCP socket to %s failed to shutdown: %s.",
-                inetAddressToString(_socketAddress).c_str(), sockErrBuf);
-            }
-            */
-            epicsSocketDestroy ( _channel );
-        }
-        break;
-        case esscimqi_socketSigAlarmRequired:
-        // not supported anymore anyway
-        default:
-            epicsSocketDestroy(_channel);
-        }
-
-        _channel = INVALID_SOCKET; //TODO: mutex to guard _channel
-    }
-
-    Transport::shared_pointer thisSharedPtr = this->shared_from_this();
-    _context->getTransportRegistry()->remove(thisSharedPtr);
 }
 
 
@@ -1383,7 +1398,7 @@ public:
     }
 
     void send(ByteBuffer* buffer, TransportSendControl* control) {
-        control->startMessage((int8)5, 0);
+        control->startMessage(CMD_AUTHNZ, 0);
         SerializationHelper::serializeFull(buffer, control, _data);
         // send immediately
         control->flush(true);
@@ -1516,12 +1531,11 @@ void BlockingServerTCPTransportCodec::send(ByteBuffer* buffer,
         buffer->putShort(0x7FFF);
 
         // list of authNZ plugin names
-        map<string, SecurityPlugin::shared_pointer>& securityPlugins = _context->getSecurityPlugins();
+        const Context::securityPlugins_t& securityPlugins = _context->getSecurityPlugins();
         vector<string> validSPNames;
         validSPNames.reserve(securityPlugins.size());
 
-        for (map<string, SecurityPlugin::shared_pointer>::const_iterator iter =
-                    securityPlugins.begin();
+        for (Context::securityPlugins_t::const_iterator iter(securityPlugins.begin());
                 iter != securityPlugins.end(); iter++)
         {
             SecurityPlugin::shared_pointer securityPlugin = iter->second;
@@ -1569,20 +1583,20 @@ void BlockingServerTCPTransportCodec::destroyAllChannels() {
     {
         LOG(
             logLevelDebug,
-            "Transport to %s still has %zd channel(s) active and closing...",
+            "Transport to %s still has %zu channel(s) active and closing...",
             _socketName.c_str(), _channels.size());
     }
 
-    std::map<pvAccessID, ServerChannel::shared_pointer>::iterator it = _channels.begin();
-    for(; it!=_channels.end(); it++)
-        it->second->destroy();
+    _channels_t temp;
+    temp.swap(_channels);
 
-    _channels.clear();
+    for(_channels_t::iterator it(temp.begin()), end(temp.end()); it!=end; ++it)
+        it->second->destroy();
 }
 
-void BlockingServerTCPTransportCodec::internalClose(bool force) {
+void BlockingServerTCPTransportCodec::internalClose() {
     Transport::shared_pointer thisSharedPtr = shared_from_this();
-    BlockingTCPTransportCodec::internalClose(force);
+    BlockingTCPTransportCodec::internalClose();
     destroyAllChannels();
 }
 
@@ -1600,7 +1614,7 @@ void BlockingServerTCPTransportCodec::authenticationCompleted(epics::pvData::Sta
         string errorMessage = "Re-authentication failed: " + status.getMessage();
         if (!status.getStackDump().empty())
             errorMessage += "\n" + status.getStackDump();
-        LOG(logLevelInfo, errorMessage.c_str());
+        LOG(logLevelInfo, "%s", errorMessage.c_str());
 
         close();
     }
@@ -1614,8 +1628,7 @@ void BlockingServerTCPTransportCodec::authNZInitialize(const std::string& securi
     // check if plug-in name is valid
     SecurityPlugin::shared_pointer securityPlugin;
 
-    map<string, SecurityPlugin::shared_pointer>::iterator spIter =
-        _context->getSecurityPlugins().find(securityPluginName);
+    Context::securityPlugins_t::const_iterator spIter(_context->getSecurityPlugins().find(securityPluginName));
     if (spIter != _context->getSecurityPlugins().end())
         securityPlugin = spIter->second;
     if (!securityPlugin)
@@ -1766,24 +1779,15 @@ bool BlockingClientTCPTransportCodec::acquire(ClientChannelImpl::shared_pointer 
 }
 
 // _mutex is held when this method is called
-void BlockingClientTCPTransportCodec::internalClose(bool forced) {
-    BlockingTCPTransportCodec::internalClose(forced);
+void BlockingClientTCPTransportCodec::internalClose() {
+    BlockingTCPTransportCodec::internalClose();
 
     TimerCallbackPtr tcb = std::tr1::dynamic_pointer_cast<TimerCallback>(shared_from_this());
     _context->getTimer()->cancel(tcb);
-}
-
-void BlockingClientTCPTransportCodec::internalPostClose(bool forced) {
-    BlockingTCPTransportCodec::internalPostClose(forced);
 
     // _owners cannot change when transport is closed
-    closedNotifyClients();
-}
 
-/**
- * Notifies clients about disconnect.
- */
-void BlockingClientTCPTransportCodec::closedNotifyClients() {
+    // Notifies clients about disconnect.
 
     // check if still acquired
     size_t refs = _owners.size();
@@ -1793,7 +1797,7 @@ void BlockingClientTCPTransportCodec::closedNotifyClients() {
         {
             LOG(
                 logLevelDebug,
-                "Transport to %s still has %d client(s) active and closing...",
+                "Transport to %s still has %zu client(s) active and closing...",
                 _socketName.c_str(), refs);
         }
 
@@ -1924,13 +1928,12 @@ void BlockingClientTCPTransportCodec::authNZInitialize(const std::vector<std::st
 {
     if (!offeredSecurityPlugins.empty())
     {
-        map<string, SecurityPlugin::shared_pointer>& availableSecurityPlugins =
-            _context->getSecurityPlugins();
+        const Context::securityPlugins_t& availableSecurityPlugins(_context->getSecurityPlugins());
 
         for (vector<string>::const_iterator offeredSP = offeredSecurityPlugins.begin();
                 offeredSP != offeredSecurityPlugins.end(); offeredSP++)
         {
-            map<string, SecurityPlugin::shared_pointer>::iterator spi = availableSecurityPlugins.find(*offeredSP);
+            Context::securityPlugins_t::const_iterator spi(availableSecurityPlugins.find(*offeredSP));
             if (spi != availableSecurityPlugins.end())
             {
                 SecurityPlugin::shared_pointer securityPlugin = spi->second;

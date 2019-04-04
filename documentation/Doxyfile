@@ -38,7 +38,7 @@ PROJECT_NAME           = pvAccessCPP
 # could be handy for archiving the generated documentation or if some version
 # control system is used.
 
-PROJECT_NUMBER         = 
+PROJECT_NUMBER         = 6.1.1
 
 # Using the PROJECT_BRIEF tag one can provide an optional one line description
 # for a project that appears at the top of each page and should give viewer a
@@ -768,6 +768,7 @@ WARN_LOGFILE           =
 INPUT                  = ../src/client/pv \
                          ../src/client/pva \
                          ../src/server/pv \
+                         ../src/server/pva \
                          ../src/rpcClient/pv \
                          ../src/rpcService/pv \
                          ../src/utils/pv \

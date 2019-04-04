@@ -4,10 +4,6 @@
  * in file LICENSE that is included with this distribution.
  */
 
-#if defined(_WIN32) && !defined(NOMINMAX)
-#define NOMINMAX
-#endif
-
 #include <sstream>
 #include <time.h>
 #include <stdlib.h>
@@ -27,6 +23,7 @@
 
 #include <osiSock.h>
 #include <osiProcess.h>
+#include <epicsAssert.h>
 
 #include <pv/byteBuffer.h>
 #include <pv/timer.h>
@@ -62,6 +59,7 @@ static BitSet::shared_pointer createBitSetFor(
     PVStructure::shared_pointer const & pvStructure,
     BitSet::shared_pointer const & existingBitSet)
 {
+    assert(pvStructure);
     int pvStructureSize = pvStructure->getNumberFields();
     if (existingBitSet.get() && static_cast<int32>(existingBitSet->size()) >= pvStructureSize)
     {
@@ -226,10 +224,10 @@ void ServerEchoHandler::handleResponse(osiSockAddr* responseFrom,
 
 /****************************************************************************************/
 
-std::string ServerSearchHandler::SUPPORTED_PROTOCOL = "tcp";
+const std::string ServerSearchHandler::SUPPORTED_PROTOCOL = "tcp";
 
 ServerSearchHandler::ServerSearchHandler(ServerContextImpl::shared_pointer const & context) :
-    AbstractServerResponseHandler(context, "Search request"), _providers(context->getChannelProviders())
+    AbstractServerResponseHandler(context, "Search request")
 {
     // initialize random seed with some random value
     srand ( time(NULL) );
@@ -283,6 +281,7 @@ void ServerSearchHandler::handleResponse(osiSockAddr* responseFrom,
     const int32 count = payloadBuffer->getShort() & 0xFFFF;
 
     // TODO DoS attack?
+    //   You bet!  With a reply address encoded in the request we don't even need a forged UDP header.
     const bool responseRequired = (QOS_REPLY_REQUIRED & qosCode) != 0;
 
     //
@@ -323,6 +322,7 @@ void ServerSearchHandler::handleResponse(osiSockAddr* responseFrom,
 
     if (count > 0)
     {
+        // regular name search
         for (int32 i = 0; i < count; i++)
         {
             transport->ensureData(4);
@@ -332,32 +332,32 @@ void ServerSearchHandler::handleResponse(osiSockAddr* responseFrom,
 
             if (allowed)
             {
-                // TODO object pool!!!
+                const std::vector<ChannelProvider::shared_pointer>& _providers = _context->getChannelProviders();
+
                 int providerCount = _providers.size();
                 std::tr1::shared_ptr<ServerChannelFindRequesterImpl> tp(new ServerChannelFindRequesterImpl(_context, providerCount));
                 tp->set(name, searchSequenceId, cid, responseAddress, responseRequired, false);
-                // TODO use std::make_shared
-                ChannelFindRequester::shared_pointer spr = tp;
 
                 for (int i = 0; i < providerCount; i++)
-                    _providers[i]->channelFind(name, spr);
+                    _providers[i]->channelFind(name, tp);
             }
         }
     }
     else
     {
+        // server discovery ping by pvlist
         if (allowed)
         {
-            // TODO constant
-#define MAX_SERVER_SEARCH_RESPONSE_DELAY_MS 100
-            double period = (rand() % MAX_SERVER_SEARCH_RESPONSE_DELAY_MS)/(double)1000;
+            // ~random hold-off to reduce impact of all servers responding.
+            // in [0.05, 0.15]
+            double delay = double(rand())/RAND_MAX; // [0, 1]
+            delay = delay*0.1 + 0.05;
 
             std::tr1::shared_ptr<ServerChannelFindRequesterImpl> tp(new ServerChannelFindRequesterImpl(_context, 1));
             tp->set("", searchSequenceId, 0, responseAddress, true, true);
 
-            // TODO use std::make_shared
             TimerCallback::shared_pointer tc = tp;
-            _context->getTimer()->scheduleAfterDelay(tc, period);
+            _context->getTimer()->scheduleAfterDelay(tc, delay);
         }
     }
 }
@@ -404,8 +404,6 @@ ServerChannelFindRequesterImpl* ServerChannelFindRequesterImpl::set(std::string 
     return this;
 }
 
-std::map<string, std::tr1::weak_ptr<ChannelProvider> > ServerSearchHandler::s_channelNameToProvider;
-
 void ServerChannelFindRequesterImpl::channelFindResult(const Status& /*status*/, ChannelFind::shared_pointer const & channelFind, bool wasFound)
 {
     // TODO status
@@ -431,7 +429,8 @@ void ServerChannelFindRequesterImpl::channelFindResult(const Status& /*status*/,
     {
         if (wasFound && _expectedResponseCount > 1)
         {
-            ServerSearchHandler::s_channelNameToProvider[_name] = channelFind->getChannelProvider();
+            Lock L(_context->_mutex);
+            _context->s_channelNameToProvider[_name] = channelFind->getChannelProvider();
         }
         _wasFound = wasFound;
         
@@ -446,7 +445,7 @@ void ServerChannelFindRequesterImpl::channelFindResult(const Status& /*status*/,
 
 void ServerChannelFindRequesterImpl::send(ByteBuffer* buffer, TransportSendControl* control)
 {
-    control->startMessage((int8)4, 12+4+16+2);
+    control->startMessage(CMD_SEARCH_RESPONSE, 12+4+16+2);
 
     Lock guard(_mutex);
     buffer->put(_guid.value, 0, sizeof(_guid.value));
@@ -528,7 +527,7 @@ private:
     static Structure::const_shared_pointer channelListStructure;
     static Structure::const_shared_pointer infoStructure;
 
-    static std::string helpString;
+    static const std::string helpString;
 
     ServerContextImpl::shared_pointer m_serverContext;
 
@@ -575,7 +574,7 @@ public:
             PVStringArray::shared_pointer allChannelNames = result->getSubFieldT<PVStringArray>("value");
 
             ChannelListRequesterImpl::shared_pointer listListener(new ChannelListRequesterImpl());
-            std::vector<ChannelProvider::shared_pointer>& providers = m_serverContext->getChannelProviders();
+            const std::vector<ChannelProvider::shared_pointer>& providers = m_serverContext->getChannelProviders();
 
             size_t providerCount = providers.size();
             for (size_t i = 0; i < providerCount; i++)
@@ -681,7 +680,7 @@ Structure::const_shared_pointer ServerRPCService::infoStructure =
     createStructure();
 
 
-std::string ServerRPCService::helpString =
+const std::string ServerRPCService::helpString =
     "pvAccess server RPC service.\n"
     "arguments:\n"
     "\tstring op\toperation to execute\n"
@@ -696,7 +695,7 @@ std::string ServerRPCService::helpString =
 namespace epics {
 namespace pvAccess {
 
-std::string ServerCreateChannelHandler::SERVER_CHANNEL_NAME = "server";
+const std::string ServerCreateChannelHandler::SERVER_CHANNEL_NAME = "server";
 
 void ServerCreateChannelHandler::handleResponse(osiSockAddr* responseFrom,
         Transport::shared_pointer const & transport, int8 version, int8 command,
@@ -719,7 +718,7 @@ void ServerCreateChannelHandler::handleResponse(osiSockAddr* responseFrom,
     {
 
         char host[100];
-        sockAddrToDottedIP(&transport->getRemoteAddress()->sa,host,100);
+        sockAddrToDottedIP(&transport->getRemoteAddress().sa,host,100);
         LOG(logLevelDebug,"Zero length channel name, disconnecting client: %s", host);
         disconnect(transport);
         return;
@@ -727,7 +726,7 @@ void ServerCreateChannelHandler::handleResponse(osiSockAddr* responseFrom,
     else if (channelName.size() > MAX_CHANNEL_NAME_LENGTH)
     {
         char host[100];
-        sockAddrToDottedIP(&transport->getRemoteAddress()->sa,host,100);
+        sockAddrToDottedIP(&transport->getRemoteAddress().sa,host,100);
         LOG(logLevelDebug,"Unreasonable channel name length, disconnecting client: %s", host);
         disconnect(transport);
         return;
@@ -763,10 +762,21 @@ void ServerCreateChannelHandler::handleResponse(osiSockAddr* responseFrom,
     }
     else
     {
+        const std::vector<ChannelProvider::shared_pointer>& _providers(_context->getChannelProviders());
+        ServerContextImpl::s_channelNameToProvider_t::const_iterator it;
+
         if (_providers.size() == 1)
             ServerChannelRequesterImpl::create(_providers[0], transport, channelName, cid, css);
-        else
-            ServerChannelRequesterImpl::create(ServerSearchHandler::s_channelNameToProvider[channelName].lock(), transport, channelName, cid, css);     // TODO !!!!
+        else {
+            ChannelProvider::shared_pointer prov;
+            {
+                Lock L(_context->_mutex);
+                if((it = _context->s_channelNameToProvider.find(channelName)) != _context->s_channelNameToProvider.end())
+                    prov = it->second.lock();
+            }
+            if(prov)
+                ServerChannelRequesterImpl::create(prov, transport, channelName, cid, css);
+        }
     }
 }
 
@@ -782,8 +792,7 @@ ServerChannelRequesterImpl::ServerChannelRequesterImpl(const Transport::shared_p
     _channelName(channelName),
     _cid(cid),
     _css(css),
-    _status(),
-    _mutex()
+    _created(false)
 {
 }
 
@@ -801,6 +810,8 @@ ChannelRequester::shared_pointer ServerChannelRequesterImpl::create(
 
 void ServerChannelRequesterImpl::channelCreated(const Status& status, Channel::shared_pointer const & channel)
 {
+    if(_created)
+        throw std::logic_error("Channel already created");
     if(detail::BlockingServerTCPTransportCodec::shared_pointer transport = _transport.lock())
     {
         ServerChannel::shared_pointer serverChannel;
@@ -837,6 +848,7 @@ void ServerChannelRequesterImpl::channelCreated(const Status& status, Channel::s
                 Lock guard(_mutex);
                 _status = status;
                 _serverChannel = serverChannel;
+                _created = true;
             }
 
             TransportSender::shared_pointer thisSender = shared_from_this();
@@ -881,6 +893,7 @@ void ServerChannelRequesterImpl::channelStateChange(Channel::shared_pointer cons
         ServerChannel::shared_pointer channel;
         {
             Lock guard(_mutex);
+            _created = false;
             channel= dynamic_pointer_cast<ServerChannel>(_serverChannel.lock());
         }
 
@@ -1066,9 +1079,11 @@ void ServerGetHandler::handleResponse(osiSockAddr* responseFrom,
     }
 }
 
-#define INIT_EXCEPTION_GUARD(cmd, code) \
+#define INIT_EXCEPTION_GUARD(cmd, var, code) \
     try { \
- 	    code; \
+        operation_type::shared_pointer op(code); \
+        epicsGuard<epicsMutex> G(_mutex); \
+        var = op; \
     } \
     catch (std::exception &e) { \
         Status status(Status::STATUSTYPE_FATAL, e.what()); \
@@ -1115,10 +1130,9 @@ ChannelGetRequester::shared_pointer ServerChannelGetRequesterImpl::create(Server
 void ServerChannelGetRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelGetRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_GET, _channelGet = _channel->getChannel()->createChannelGet(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_GET, _channelGet, _channel->getChannel()->createChannelGet(thisPointer, pvRequest));
 }
 
 void ServerChannelGetRequesterImpl::channelGetConnect(const Status& status, ChannelGet::shared_pointer const & channelGet, Structure::const_shared_pointer const & structure)
@@ -1375,10 +1389,9 @@ ChannelPutRequester::shared_pointer ServerChannelPutRequesterImpl::create(Server
 void ServerChannelPutRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelPutRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_PUT, _channelPut = _channel->getChannel()->createChannelPut(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_PUT, _channelPut, _channel->getChannel()->createChannelPut(thisPointer, pvRequest));
 }
 
 void ServerChannelPutRequesterImpl::channelPutConnect(const Status& status, ChannelPut::shared_pointer const & channelPut, Structure::const_shared_pointer const & structure)
@@ -1658,10 +1671,9 @@ ChannelPutGetRequester::shared_pointer ServerChannelPutGetRequesterImpl::create(
 void ServerChannelPutGetRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelPutGetRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_PUT_GET, _channelPutGet = _channel->getChannel()->createChannelPutGet(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_PUT_GET, _channelPutGet, _channel->getChannel()->createChannelPutGet(thisPointer, pvRequest));
 }
 
 void ServerChannelPutGetRequesterImpl::channelPutGetConnect(const Status& status, ChannelPutGet::shared_pointer const & channelPutGet,
@@ -1795,7 +1807,7 @@ void ServerChannelPutGetRequesterImpl::send(ByteBuffer* buffer, TransportSendCon
             return;
     }
 
-    control->startMessage((int32)12, sizeof(int32)/sizeof(int8) + 1);
+    control->startMessage(CMD_PUT_GET, sizeof(int32)/sizeof(int8) + 1);
     buffer->putInt(_ioid);
     buffer->putByte((int8)request);
     {
@@ -1879,7 +1891,7 @@ void ServerMonitorHandler::handleResponse(osiSockAddr* responseFrom,
         }
 
         // create...
-        ServerMonitorRequesterImpl::create(_context, channel, ioid, transport, pvRequest);
+        ServerMonitorRequesterImpl::shared_pointer request(ServerMonitorRequesterImpl::create(_context, channel, ioid, transport, pvRequest));
 
         // pipelining monitor (i.e. w/ flow control)
         const bool ack = (QOS_GET_PUT & qosCode) != 0;
@@ -1887,9 +1899,8 @@ void ServerMonitorHandler::handleResponse(osiSockAddr* responseFrom,
         {
             transport->ensureData(4);
             int32 nfree = payloadBuffer->getInt();
-            ServerMonitorRequesterImpl::shared_pointer request = static_pointer_cast<ServerMonitorRequesterImpl>(channel->getRequest(ioid));
 
-            request->getChannelMonitor()->reportRemoteQueueStatus(nfree);
+            request->ack(nfree);
         }
 
     }
@@ -1911,7 +1922,7 @@ void ServerMonitorHandler::handleResponse(osiSockAddr* responseFrom,
         {
             transport->ensureData(4);
             int32 nfree = payloadBuffer->getInt();
-            request->getChannelMonitor()->reportRemoteQueueStatus(nfree);
+            request->ack(nfree);
             return;
             // note: not possible to ack and destroy
         }
@@ -1954,30 +1965,40 @@ void ServerMonitorHandler::handleResponse(osiSockAddr* responseFrom,
 }
 
 ServerMonitorRequesterImpl::ServerMonitorRequesterImpl(
-    ServerContextImpl::shared_pointer const & context, ServerChannel::shared_pointer const & channel,
-    const pvAccessID ioid, Transport::shared_pointer const & transport):
-    BaseChannelRequester(context, channel, ioid, transport), _channelMonitor(), _structure(), _unlisten(false)
-{
-}
+        ServerContextImpl::shared_pointer const & context,
+        ServerChannel::shared_pointer const & channel,
+        const pvAccessID ioid, Transport::shared_pointer const & transport)
+    :BaseChannelRequester(context, channel, ioid, transport)
+    ,_window_open(0u)
+    ,_unlisten(false)
+    ,_pipeline(false)
+{}
 
-MonitorRequester::shared_pointer ServerMonitorRequesterImpl::create(
+ServerMonitorRequesterImpl::shared_pointer ServerMonitorRequesterImpl::create(
     ServerContextImpl::shared_pointer const & context, ServerChannel::shared_pointer const & channel,
     const pvAccessID ioid, Transport::shared_pointer const & transport,PVStructure::shared_pointer const & pvRequest)
 {
-    // TODO use std::make_shared
     std::tr1::shared_ptr<ServerMonitorRequesterImpl> tp(new ServerMonitorRequesterImpl(context, channel, ioid, transport));
-    MonitorRequester::shared_pointer thisPointer = tp;
-    static_cast<ServerMonitorRequesterImpl*>(thisPointer.get())->activate(pvRequest);
-    return thisPointer;
+    tp->activate(pvRequest);
+    return tp;
 }
 
 void ServerMonitorRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
+    epics::pvData::PVScalar::const_shared_pointer O(pvRequest->getSubField<epics::pvData::PVScalar>("record._options.pipeline"));
+    if(O) {
+        try{
+            _pipeline = O->getAs<epics::pvData::boolean>();
+        }catch(std::exception& e){
+            std::ostringstream strm;
+            strm<<"Ignoring invalid pipeline= : "<<e.what();
+            message(strm.str(), epics::pvData::errorMessage);
+        }
+    }
     startRequest(QOS_INIT);
-    MonitorRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_MONITOR, _channelMonitor = _channel->getChannel()->createMonitor(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_MONITOR, _channelMonitor, _channel->getChannel()->createMonitor(thisPointer, pvRequest));
 }
 
 void ServerMonitorRequesterImpl::monitorConnect(const Status& status, Monitor::shared_pointer const & monitor, epics::pvData::StructureConstPtr const & structure)
@@ -1985,7 +2006,7 @@ void ServerMonitorRequesterImpl::monitorConnect(const Status& status, Monitor::s
     {
         Lock guard(_mutex);
         _status = status;
-        _channelMonitor = monitor; //TODO inconsistent locking for _channelMonitor
+        _channelMonitor = monitor;
         _structure = structure;
     }
     TransportSender::shared_pointer thisSender = shared_from_this();
@@ -2010,18 +2031,6 @@ void ServerMonitorRequesterImpl::unlisten(Monitor::shared_pointer const & /*moni
 
 void ServerMonitorRequesterImpl::monitorEvent(Monitor::shared_pointer const & /*monitor*/)
 {
-    // TODO !!! if queueSize==0, monitor.poll() has to be called and returned NOW (since there is no cache)
-    //sendEvent(transport);
-
-    // TODO implement via TransportSender
-    /*
-    	// initiate submit to dispatcher queue, if necessary
-    	synchronized (register) {
-    		if (register.getAndSet(true))
-    			eventConsumer.consumeEvents(this);
-    	}*/
-    // TODO
-    // multiple ((BlockingServerTCPTransport)transport).enqueueMonitorSendRequest(this);
     TransportSender::shared_pointer thisSender = shared_from_this();
     _transport->enqueueSendRequest(thisSender);
 }
@@ -2035,7 +2044,8 @@ void ServerMonitorRequesterImpl::destroy()
 
     // hold a reference to channelMonitor so that _channelMonitor.reset()
     // does not call ~Monitor (external code) while we are holding a lock
-    Monitor::shared_pointer monitor = _channelMonitor;
+    Monitor::shared_pointer monitor;
+    window_t window;
     {
         Lock guard(_mutex);
         _channel->unregisterRequest(_ioid);
@@ -2043,17 +2053,19 @@ void ServerMonitorRequesterImpl::destroy()
         // asCheck
         _channel->getChannelSecuritySession()->release(_ioid);
 
-        if (_channelMonitor)
-        {
-            _channelMonitor->destroy();
-            _channelMonitor.reset();
-        }
+        window.swap(_window_closed);
+
+        monitor.swap(_channelMonitor);
+    }
+    window.clear();
+    if(monitor) {
+        monitor->destroy();
     }
 }
 
 Monitor::shared_pointer ServerMonitorRequesterImpl::getChannelMonitor()
 {
-    //Lock guard(_mutex);
+    Lock guard(_mutex);
     return _channelMonitor;
 }
 
@@ -2082,21 +2094,31 @@ void ServerMonitorRequesterImpl::send(ByteBuffer* buffer, TransportSendControl* 
     }
     else
     {
-        Monitor::shared_pointer monitor = _channelMonitor;
+        Monitor::shared_pointer monitor(getChannelMonitor());
         if (!monitor)
             return;
 
         // TODO asCheck ?
 
-        MonitorElement::shared_pointer element = monitor->poll();
-        if (element.get())
+        bool busy = false;
+        if(_pipeline) {
+            Lock guard(_mutex);
+            busy = _window_open==0;
+        }
+
+        MonitorElement::Ref element;
+        if(!busy) {
+            MonitorElement::Ref E(monitor);
+            E.swap(element);
+        }
+        if (element)
         {
             control->startMessage((int8)CMD_MONITOR, sizeof(int32)/sizeof(int8) + 1);
             buffer->putInt(_ioid);
             buffer->putByte((int8)request);
 
             // changedBitSet and data, if not notify only (i.e. queueSize == -1)
-            BitSet::shared_pointer changedBitSet = element->changedBitSet;
+            const BitSet::shared_pointer& changedBitSet = element->changedBitSet;
             if (changedBitSet)
             {
                 changedBitSet->serialize(buffer, control);
@@ -2106,7 +2128,22 @@ void ServerMonitorRequesterImpl::send(ByteBuffer* buffer, TransportSendControl* 
                 element->overrunBitSet->serialize(buffer, control);
             }
 
-            monitor->release(element);
+            {
+                Lock guard(_mutex);
+                if(!_pipeline) {
+                } else if(_window_open==0) {
+                    // This really shouldn't happen as the above ensures that _window_open *was* non-zero,
+                    // and only we (the sender) will decrement.
+                    message("Monitor Logic Error: send outside of window", epics::pvData::warningMessage);
+                    LOG(logLevelError, "Monitor Logic Error: send outside of window %zu", _window_closed.size());
+
+                } else {
+                    _window_closed.push_back(element.letGo());
+                    _window_open--;
+                }
+            }
+
+            element.reset(); // calls Monitor::release() if not swap()'d
 
             // TODO if we try to proces several monitors at once, then fairness suffers
             // TODO compbine several monitors into one message (reduces payload)
@@ -2115,12 +2152,22 @@ void ServerMonitorRequesterImpl::send(ByteBuffer* buffer, TransportSendControl* 
         }
         else
         {
-            // TODO CAS
             bool unlisten;
-            Lock guard(_mutex);
-            unlisten = _unlisten;
-            _unlisten = false;
-            guard.unlock();
+            window_t window;
+            {
+                Lock guard(_mutex);
+                unlisten = _unlisten;
+                _unlisten = false;
+                if(unlisten) {
+                    window.swap(_window_closed);
+                    _window_open = 0u;
+                }
+            }
+
+            for(window_t::iterator it(window.begin()), end(window.end()); it!=end; ++it) {
+                monitor->release(*it);
+            }
+            window.clear();
 
             if (unlisten)
             {
@@ -2132,6 +2179,43 @@ void ServerMonitorRequesterImpl::send(ByteBuffer* buffer, TransportSendControl* 
         }
 
     }
+}
+
+void ServerMonitorRequesterImpl::ack(size_t cnt)
+{
+    typedef std::vector<MonitorElementPtr> acking_t;
+    acking_t acking;
+    Monitor::shared_pointer mon;
+    {
+        Lock guard(_mutex);
+
+        // cnt will be larger if this is the initial window update,
+        // or if the window is being enlarged.
+        size_t nack = std::min(cnt, _window_closed.size());
+
+        _window_open += cnt;
+
+        window_t::iterator it, end(_window_closed.begin());
+        std::advance(end, nack);
+
+        acking.resize(nack);
+
+        size_t i;
+        for(i=0, it=_window_closed.begin(); i<nack; i++, ++it)
+        {
+            acking[i].swap(*it);
+        }
+
+        _window_closed.erase(_window_closed.begin(), end);
+
+        mon = _channelMonitor;
+    }
+
+    for(acking_t::iterator it(acking.begin()), end(acking.end()); it!=end; ++it) {
+        mon->release(*it);
+    }
+
+    mon->reportRemoteQueueStatus(cnt);
 }
 
 /****************************************************************************************/
@@ -2299,10 +2383,9 @@ ChannelArrayRequester::shared_pointer ServerChannelArrayRequesterImpl::create(
 void ServerChannelArrayRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelArrayRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_ARRAY, _channelArray = _channel->getChannel()->createChannelArray(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_ARRAY, _channelArray, _channel->getChannel()->createChannelArray(thisPointer, pvRequest));
 }
 
 void ServerChannelArrayRequesterImpl::channelArrayConnect(const Status& status, ChannelArray::shared_pointer const & channelArray, Array::const_shared_pointer const & array)
@@ -2521,29 +2604,27 @@ void ServerCancelRequestHandler::handleResponse(osiSockAddr* responseFrom,
     const pvAccessID ioid = payloadBuffer->getInt();
 
     ServerChannel::shared_pointer channel = casTransport->getChannel(sid);
-    if (!channel.get())
+    if (!channel)
     {
         failureResponse(transport, ioid, BaseChannelRequester::badCIDStatus);
         return;
     }
 
-    Destroyable::shared_pointer request = channel->getRequest(ioid);
-    if (!request.get())
+    BaseChannelRequester::shared_pointer request(channel->getRequest(ioid));
+    if (!request)
     {
         failureResponse(transport, ioid, BaseChannelRequester::badIOIDStatus);
         return;
     }
 
-    ChannelRequest::shared_pointer cr = dynamic_pointer_cast<ChannelRequest>(request);
-    if (!cr.get())
+    ChannelRequest::shared_pointer cr = dynamic_pointer_cast<ChannelRequest>(request->getOperation());
+    if (!cr)
     {
         failureResponse(transport, ioid, BaseChannelRequester::notAChannelRequestStatus);
         return;
     }
 
-    // cancel
     cr->cancel();
-
 }
 
 void ServerCancelRequestHandler::failureResponse(Transport::shared_pointer const & transport, pvAccessID ioid, const Status& errorStatus)
@@ -2647,10 +2728,9 @@ ChannelProcessRequester::shared_pointer ServerChannelProcessRequesterImpl::creat
 void ServerChannelProcessRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelProcessRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_PROCESS, _channelProcess = _channel->getChannel()->createChannelProcess(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_PROCESS, _channelProcess, _channel->getChannel()->createChannelProcess(thisPointer, pvRequest));
 }
 
 void ServerChannelProcessRequesterImpl::channelProcessConnect(const Status& status, ChannelProcess::shared_pointer const & channelProcess)
@@ -2910,6 +2990,7 @@ ServerChannelRPCRequesterImpl::ServerChannelRPCRequesterImpl(
     const pvAccessID ioid, Transport::shared_pointer const & transport):
     BaseChannelRequester(context, channel, ioid, transport),
     _channelRPC(), _pvResponse()
+  ,_status(Status::fatal("Invalid State"))
 
 {
 }
@@ -2927,10 +3008,9 @@ ChannelRPCRequester::shared_pointer ServerChannelRPCRequesterImpl::create(
 void ServerChannelRPCRequesterImpl::activate(PVStructure::shared_pointer const & pvRequest)
 {
     startRequest(QOS_INIT);
-    ChannelRPCRequester::shared_pointer thisPointer = shared_from_this();
-    Destroyable::shared_pointer thisDestroyable = shared_from_this();
-    _channel->registerRequest(_ioid, thisDestroyable);
-    INIT_EXCEPTION_GUARD(CMD_RPC, _channelRPC = _channel->getChannel()->createChannelRPC(thisPointer, pvRequest));
+    shared_pointer thisPointer(shared_from_this());
+    _channel->registerRequest(_ioid, thisPointer);
+    INIT_EXCEPTION_GUARD(CMD_RPC, _channelRPC, _channel->getChannel()->createChannelRPC(thisPointer, pvRequest));
 }
 
 void ServerChannelRPCRequesterImpl::channelRPCConnect(const Status& status, ChannelRPC::shared_pointer const & channelRPC)
@@ -3013,6 +3093,7 @@ void ServerChannelRPCRequesterImpl::send(ByteBuffer* buffer, TransportSendContro
                 SerializationHelper::serializeStructureFull(buffer, control, _pvResponse);
             }
         }
+        _status = Status::fatal("Stale state");
     }
 
     stopRequest();

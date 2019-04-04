@@ -66,7 +66,10 @@ bool pvAccessIsLoggable(pvAccessLogLevel level)
     return level >= g_pvAccessLogLevel;
 }
 
-class FileLogger : public NoDefaultMethods {
+namespace {
+
+class FileLogger {
+    EPICS_NOT_COPYABLE(FileLogger)
 public:
     FileLogger(std::string const & name) {
         logFile.open(name.data(), ios::app);
@@ -89,16 +92,18 @@ private:
 
 };
 
-static FileLogger* fileLogger = NULL;
+FileLogger* fileLogger = NULL;
 
-static void errLogFileListener(void* /*pPrivate*/, const char *message) {
+void errLogFileListener(void* /*pPrivate*/, const char *message) {
     fileLogger->logMessage(message);
 }
 
-static void exitFileLoggerHandler(void* /*pPrivate*/) {
+void exitFileLoggerHandler(void* /*pPrivate*/) {
     errlogFlush();
     delete fileLogger;
 }
+
+} // namespace
 
 void createFileLogger(std::string const & fname) {
     static Mutex mutex;

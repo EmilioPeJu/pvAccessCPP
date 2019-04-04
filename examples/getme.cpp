@@ -60,7 +60,7 @@ struct Getter : public pvac::ClientChannel::GetCallback,
         op.cancel();
     }
 
-    virtual void getDone(const pvac::GetEvent& event)
+    virtual void getDone(const pvac::GetEvent& event) OVERRIDE FINAL
     {
         switch(event.event) {
         case pvac::GetEvent::Fail:
@@ -78,7 +78,7 @@ struct Getter : public pvac::ClientChannel::GetCallback,
         }
     }
 
-    virtual void connectEvent(const pvac::ConnectEvent& evt)
+    virtual void connectEvent(const pvac::ConnectEvent& evt) OVERRIDE FINAL
     {
         if(evt.connected) {
             op = channel.get(this);
@@ -114,7 +114,7 @@ int main(int argc, char *argv[]) {
                 std::cout<<"Usage: "<<argv[0]<<" [-p <provider>] [-w <timeout>] [-R] <pvname> ...\n";
                 return 0;
             default:
-                std::cerr<<"Unknown argument: "<<opt<<"\n";
+                std::cerr<<"Unknown argument: "<<(int)opt<<"\n";
                 return -1;
             }
         }
