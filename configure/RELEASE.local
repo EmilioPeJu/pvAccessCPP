@@ -1,2 +1,2 @@
-PVDATA = $(SUPPORT)/pvDataCPP/7-1-2dls1
+PVDATA = $(SUPPORT)/pvDataCPP/8-0-0
 PVCOMMON = $(SUPPORT)/pvCommonCPP/4-2-3
